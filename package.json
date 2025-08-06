@@ -1,7 +1,7 @@
 {
   "name": "gemini-desk-server",
   "version": "1.0.0",
-  "description": "GeminiDesk Telegram Bot Server for Render deployment",
+  "description": "GeminiDesk Telegram Bot Server for Render",
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
@@ -9,7 +9,10 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "node-fetch": "^2.6.7"
+    "node-telegram-bot-api": "^0.64.0",
+    "node-cache": "^5.1.2",
+    "multer": "^1.4.5-lts.1",
+    "node-cron": "^3.0.3"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
