@@ -12,7 +12,7 @@ const cron = require('node-cron');
 const fetch = require('node-fetch'); // Required for fetching HTML file for broadcasts
 
 // --- Configuration ---
-const BOT_TOKEN = '8416296712AAEj1Ff-6cwVzae1IkCHhS2kyha8GXBW2sU';
+const BOT_TOKEN = '8269940964:AAGnrhFtLPZUJHP_mMtrI8skdlqDhkSFJIg';
 const ADMIN_CHAT_ID = '7547836101';
 const PORT = process.env.PORT || 3000;
 
