@@ -1,7 +1,7 @@
 {
   "name": "gemini-desk-server",
-  "version": "1.0.0",
-  "description": "GeminiDesk Telegram Bot Server for Render",
+  "version": "1.1.0",
+  "description": "GeminiDesk Bot and Remote Management Server for Render",
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
@@ -12,7 +12,8 @@
     "node-telegram-bot-api": "^0.64.0",
     "node-cache": "^5.1.2",
     "multer": "^1.4.5-lts.1",
-    "node-cron": "^3.0.3"
+    "node-cron": "^3.0.3",
+    "ws": "^8.17.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
@@ -24,8 +25,10 @@
     "telegram",
     "bot",
     "express",
-    "render"
+    "render",
+    "websocket",
+    "remote-control"
   ],
-  "author": "Your Name",
+  "author": "Hillel BH",
   "license": "MIT"
 }
