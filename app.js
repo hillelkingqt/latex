@@ -43,7 +43,9 @@ wss.on('connection', (ws, req) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const clientId = url.searchParams.get('clientId');
     const clientName = url.searchParams.get('clientName');
-
+const presenceInterval = setInterval(() => {
+    cache.set(`client:${clientId}`, { name: clientName }, 120);
+}, 60 * 1000); // רענן את הנוכחות כל 60 שניות
     if (!clientId || !clientName) {
         console.error('[WebSocket] Connection attempt with missing info. Terminating.');
         return ws.terminate();
@@ -53,6 +55,7 @@ wss.on('connection', (ws, req) => {
     
     // Store the active connection
     clients.set(clientId, { ws, name: clientName });
+    cache.set(`client:${clientId}`, { name: clientName }, 120); // שמור ב-cache לדקה (TTL של 120 שניות)
 
     ws.on('message', (message) => {
         try {
@@ -67,6 +70,7 @@ wss.on('connection', (ws, req) => {
     ws.on('close', () => {
         console.log(`[WebSocket] Client Disconnected: ${clientName} (ID: ${clientId.substring(0, 8)}...)`);
         clients.delete(clientId);
+        clearInterval(presenceInterval); // נקה את הרענון התקופתי
     });
 
     ws.on('error', (error) => {
@@ -348,16 +352,39 @@ async function showMainMenu(chatId, text = 'Welcome, Admin! This is the GeminiDe
 }
 
 async function showClientList(chatId, messageId) {
-    const onlineClients = Array.from(clients.entries());
+    // --- קרא את רשימת הלקוחות מה-CACHE ---
+    const clientKeys = cache.keys().filter(key => key.startsWith('client:'));
     const keyboard = [];
-    if (onlineClients.length > 0) {
-        onlineClients.forEach(([id, client]) => {
-            keyboard.push([{ text: `🟢 ${client.name}`, callback_data: `select_client:${id}` }]);
+
+    if (clientKeys.length > 0) {
+        clientKeys.forEach(key => {
+            const clientId = key.split(':')[1];
+            const clientData = cache.get(key);
+            if (clientData) {
+                // ודא שהלקוח באמת מחובר ב-WebSocket לפני שמציגים אותו
+                if (clients.has(clientId) && clients.get(clientId).ws.readyState === WebSocket.OPEN) {
+                     keyboard.push([{ text: `🟢 ${clientData.name}`, callback_data: `select_client:${clientId}` }]);
+                } else {
+                    // אם הוא רשום ב-cache אבל לא מחובר, הצג אותו כאופליין
+                     keyboard.push([{ text: `🔴 ${clientData.name} (Offline)`, callback_data: `noop` }]);
+                }
+            }
         });
     }
+    
     keyboard.push([{ text: '‹ Back to Main Menu', callback_data: 'back_to_main' }]);
-    const text = onlineClients.length > 0 ? 'Select a connected client:' : 'No clients are currently connected.';
-    return bot.editMessageText(text, { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: keyboard } });
+    const text = clientKeys.length > 0 ? 'Select a connected client:' : 'No clients are currently connected.';
+
+    const options = {
+        chat_id: chatId,
+        reply_markup: { inline_keyboard: keyboard }
+    };
+
+    if (messageId) {
+        await bot.editMessageText(text, { ...options, message_id: messageId }).catch(console.error);
+    } else {
+        await bot.sendMessage(chatId, text, options).catch(console.error);
+    }
 }
 
 function showBroadcastMenu(chatId, messageId) {
