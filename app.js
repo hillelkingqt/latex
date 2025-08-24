@@ -162,10 +162,21 @@ app.post('/register', (req, res) => {
     try {
         const { clientId, clientName } = req.body;
         if (clientId && clientName) {
-            // עדכן את השם במטמון. זה ישפיע על מה שמוצג בטלגרם.
-            // TTL קצר כדי שאם הלקוח נסגר, הוא ייעלם מהרשימה.
+            // עדכן את השם במטמון
             cache.set(`client:${clientId}`, { name: clientName }, 120); // Keep for 2 minutes
-            console.log(`[HTTP Register] Updated presence for ${clientName} (ID: ${clientId.substring(0, 8)}...)`);
+            
+            // ✅ לוג משופר
+            const shortId = clientId.substring(0, 8);
+            console.log(`[HTTP Register] Updated presence for ${clientName} (ID: ${shortId}...)`);
+            
+            // ✅ בדיקה אם יש גם WebSocket
+            const hasWebSocket = clients.has(clientId);
+            if (hasWebSocket) {
+                console.log(`[HTTP Register] ${clientName} also has active WebSocket connection`);
+            } else {
+                console.log(`[HTTP Register] ${clientName} has NO WebSocket (remote control unavailable)`);
+            }
+            
             res.status(200).send('Presence updated.');
         } else {
             res.status(400).send('Missing client info.');
@@ -493,9 +504,18 @@ async function showClientList(chatId, messageId) {
             const clientId = key.split(':')[1];
             const clientData = cache.get(key);
             if (clientData) {
-                if (clients.has(clientId) && clients.get(clientId).ws.readyState === WebSocket.OPEN) {
-                    keyboard.push([{ text: `🟢 ${clientData.name}`, callback_data: makeCb('select_client', { clientId }) }]);
+                // ✅ בדיקה משולבת: WebSocket + HTTP Register
+                const hasWebSocket = clients.has(clientId) && clients.get(clientId).ws.readyState === WebSocket.OPEN;
+                const hasRecentRegister = cache.get(key) !== undefined; // אם קיים ב-cache = רגיסטר אחרון
+                
+                if (hasWebSocket) {
+                    // יש WebSocket פעיל = פיצ'רים מלאים
+                    keyboard.push([{ text: `🟢 ${clientData.name} (Full Control)`, callback_data: makeCb('select_client', { clientId }) }]);
+                } else if (hasRecentRegister) {
+                    // רק HTTP Register = חצי פעיל
+                    keyboard.push([{ text: `🟡 ${clientData.name} (Limited - No Remote Control)`, callback_data: `noop` }]);
                 } else {
+                    // לא פעיל בכלל
                     keyboard.push([{ text: `🔴 ${clientData.name} (Offline)`, callback_data: `noop` }]);
                 }
             }
@@ -503,7 +523,7 @@ async function showClientList(chatId, messageId) {
     }
     
     keyboard.push([{ text: '‹ Back to Main Menu', callback_data: 'back_to_main' }]);
-    const text = clientKeys.length > 0 ? 'Select a connected client:' : 'No clients are currently connected.';
+    const text = clientKeys.length > 0 ? 'Client Status Legend:\n🟢 = Full Control Available\n🟡 = App Running (No Remote Control)\n🔴 = Offline\n\nSelect a client:' : 'No clients are currently connected.';
 
     const options = { chat_id: chatId, reply_markup: { inline_keyboard: keyboard } };
 
