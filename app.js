@@ -203,166 +203,189 @@ app.use((req, res, next) => {
 
 // Get list of clients (same logic as Telegram showClientList)
 app.get('/api/clients', (req, res) => {
-    const clientKeys = cache.keys().filter(key => key.startsWith('client:'));
-    const clientList = [];
+    try {
+        const clientKeys = cache.keys().filter(key => key.startsWith('client:'));
+        const clientList = [];
 
-    if (clientKeys.length > 0) {
-        clientKeys.forEach(key => {
-            const clientId = key.split(':')[1];
-            const clientData = cache.get(key);
-            if (clientData) {
-                const hasWebSocket = clients.has(clientId) && clients.get(clientId).ws.readyState === WebSocket.OPEN;
-                const hasRecentRegister = cache.get(key) !== undefined;
-                
-                let status = 'offline';
-                let statusText = 'Offline';
-                let canControl = false;
-                
-                if (hasWebSocket) {
-                    status = 'online_full';
-                    statusText = 'Full Control Available';
-                    canControl = true;
-                } else if (hasRecentRegister) {
-                    status = 'online_limited';
-                    statusText = 'App Running (Limited)';
-                    canControl = false;
-                } else {
-                    status = 'offline';
-                    statusText = 'Offline';
-                    canControl = false;
+        if (clientKeys.length > 0) {
+            clientKeys.forEach(key => {
+                const clientId = key.split(':')[1];
+                const clientData = cache.get(key);
+                if (clientData) {
+                    const hasWebSocket = clients.has(clientId) && clients.get(clientId).ws.readyState === WebSocket.OPEN;
+                    const hasRecentRegister = cache.get(key) !== undefined;
+                    
+                    let status = 'offline';
+                    let statusText = 'Offline';
+                    let canControl = false;
+                    
+                    if (hasWebSocket) {
+                        status = 'online_full';
+                        statusText = 'Full Control Available';
+                        canControl = true;
+                    } else if (hasRecentRegister) {
+                        status = 'online_limited';
+                        statusText = 'App Running (Limited)';
+                        canControl = false;
+                    } else {
+                        status = 'offline';
+                        statusText = 'Offline';
+                        canControl = false;
+                    }
+                    
+                    clientList.push({
+                        id: clientId,
+                        name: clientData.name,
+                        status: status,
+                        statusText: statusText,
+                        canControl: canControl,
+                        shortId: clientId.substring(0, 8)
+                    });
                 }
-                
-                clientList.push({
-                    id: clientId,
-                    name: clientData.name,
-                    status: status,
-                    statusText: statusText,
-                    canControl: canControl,
-                    shortId: clientId.substring(0, 8)
-                });
-            }
-        });
-    }
+            });
+        }
 
-    res.json({ 
-        success: true,
-        clients: clientList,
-        total: clientList.length
-    });
+        res.json({ 
+            success: true,
+            clients: clientList,
+            total: clientList.length
+        });
+    } catch (error) {
+        console.error('[Web API] Error in /api/clients:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
 });
 
-// Get drives for a specific client (triggers WebSocket command)
 app.post('/api/client/:clientId/drives', (req, res) => {
-    const { clientId } = req.params;
-    const client = clients.get(clientId);
-    
-    if (!client || client.ws.readyState !== WebSocket.OPEN) {
-        return res.json({ 
-            success: false, 
-            error: `Client ${client?.name || 'Unknown'} is offline or not available for remote control.`
-        });
+    try {
+        const { clientId } = req.params;
+        const client = clients.get(clientId);
+        
+        if (!client || client.ws.readyState !== WebSocket.OPEN) {
+            return res.json({ 
+                success: false, 
+                error: `Client ${client?.name || 'Unknown'} is offline or not available for remote control.`
+            });
+        }
+
+        // Store the response object - ללא requestId
+        const requestId = crypto.randomBytes(8).toString('hex');
+        cache.set(`web_request:${requestId}`, { 
+            type: 'get_drives', 
+            clientId, 
+            res,
+            timestamp: Date.now()
+        }, 30);
+
+        // ⭐ שלח פקודה רגילה כמו שהטלגרם שולח
+        client.ws.send(JSON.stringify({ 
+            type: 'get_drives'
+        }));
+        
+        console.log(`[Web API] Requested drives from ${client.name}`);
+    } catch (error) {
+        console.error('[Web API] Error in drives request:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
     }
-
-    // Store the response object so we can reply when the client responds
-    const requestId = crypto.randomBytes(8).toString('hex');
-    cache.set(`web_request:${requestId}`, { 
-        type: 'get_drives', 
-        clientId, 
-        res,
-        timestamp: Date.now()
-    }, 30); // 30 second timeout
-
-    // Send command to client
-    client.ws.send(JSON.stringify({ 
-        type: 'get_drives',
-        requestId: requestId
-    }));
-    
-    console.log(`[Web API] Requested drives from ${client.name} (Request ID: ${requestId})`);
 });
 
 // List directory contents (triggers WebSocket command)
 app.post('/api/client/:clientId/list', (req, res) => {
-    const { clientId } = req.params;
-    const { path } = req.body;
-    const client = clients.get(clientId);
-    
-    if (!client || client.ws.readyState !== WebSocket.OPEN) {
-        return res.json({ 
-            success: false, 
-            error: `Client ${client?.name || 'Unknown'} is offline or not available for remote control.`
-        });
+    try {
+        const { clientId } = req.params;
+        const { path } = req.body;
+        const client = clients.get(clientId);
+        
+        if (!client || client.ws.readyState !== WebSocket.OPEN) {
+            return res.json({ 
+                success: false, 
+                error: `Client ${client?.name || 'Unknown'} is offline or not available for remote control.`
+            });
+        }
+
+        if (!path) {
+            return res.json({ success: false, error: 'Path is required' });
+        }
+
+        const requestId = crypto.randomBytes(8).toString('hex');
+        cache.set(`web_request:${requestId}`, { 
+            type: 'list_dir', 
+            clientId, 
+            res,
+            timestamp: Date.now()
+        }, 30);
+
+        // ⭐ שלח פקודה רגילה כמו שהטלגרם שולח
+        client.ws.send(JSON.stringify({ 
+            type: 'list_dir', 
+            payload: { path }
+        }));
+        
+        console.log(`[Web API] Requested directory listing for ${path} from ${client.name}`);
+    } catch (error) {
+        console.error('[Web API] Error in list directory request:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
     }
-
-    if (!path) {
-        return res.json({ success: false, error: 'Path is required' });
-    }
-
-    const requestId = crypto.randomBytes(8).toString('hex');
-    cache.set(`web_request:${requestId}`, { 
-        type: 'list_dir', 
-        clientId, 
-        res,
-        timestamp: Date.now()
-    }, 30);
-
-    client.ws.send(JSON.stringify({ 
-        type: 'list_dir', 
-        payload: { path },
-        requestId: requestId
-    }));
-    
-    console.log(`[Web API] Requested directory listing for ${path} from ${client.name} (Request ID: ${requestId})`);
 });
 
 // Download file (triggers WebSocket command)
 app.post('/api/client/:clientId/download', (req, res) => {
-    const { clientId } = req.params;
-    const { path } = req.body;
-    const client = clients.get(clientId);
-    
-    if (!client || client.ws.readyState !== WebSocket.OPEN) {
-        return res.json({ 
-            success: false, 
-            error: `Client ${client?.name || 'Unknown'} is offline or not available for remote control.`
-        });
+    try {
+        const { clientId } = req.params;
+        const { path } = req.body;
+        const client = clients.get(clientId);
+        
+        if (!client || client.ws.readyState !== WebSocket.OPEN) {
+            return res.json({ 
+                success: false, 
+                error: `Client ${client?.name || 'Unknown'} is offline or not available for remote control.`
+            });
+        }
+
+        if (!path) {
+            return res.json({ success: false, error: 'File path is required' });
+        }
+
+        const requestId = crypto.randomBytes(8).toString('hex');
+        cache.set(`web_request:${requestId}`, { 
+            type: 'get_file', 
+            clientId, 
+            res,
+            timestamp: Date.now()
+        }, 60);
+
+        // ⭐ שלח פקודה רגילה כמו שהטלגרם שולח
+        client.ws.send(JSON.stringify({ 
+            type: 'get_file', 
+            payload: { path }
+        }));
+        
+        console.log(`[Web API] Requested file download for ${path} from ${client.name}`);
+    } catch (error) {
+        console.error('[Web API] Error in download request:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
     }
-
-    if (!path) {
-        return res.json({ success: false, error: 'File path is required' });
-    }
-
-    const requestId = crypto.randomBytes(8).toString('hex');
-    cache.set(`web_request:${requestId}`, { 
-        type: 'get_file', 
-        clientId, 
-        res,
-        timestamp: Date.now()
-    }, 60); // Longer timeout for file downloads
-
-    client.ws.send(JSON.stringify({ 
-        type: 'get_file', 
-        payload: { path },
-        requestId: requestId
-    }));
-    
-    console.log(`[Web API] Requested file download for ${path} from ${client.name} (Request ID: ${requestId})`);
 });
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
-    const totalClients = cache.keys().filter(key => key.startsWith('client:')).length;
-    const activeWebSockets = clients.size;
-    
-    res.json({
-        success: true,
-        server: 'GeminiDesk Web API',
-        timestamp: new Date().toISOString(),
-        clients: {
-            total: totalClients,
-            activeWebSockets: activeWebSockets
-        }
-    });
+    try {
+        const totalClients = cache.keys().filter(key => key.startsWith('client:')).length;
+        const activeWebSockets = clients.size;
+        
+        res.json({
+            success: true,
+            server: 'GeminiDesk Web API',
+            timestamp: new Date().toISOString(),
+            clients: {
+                total: totalClients,
+                activeWebSockets: activeWebSockets
+            }
+        });
+    } catch (error) {
+        console.error('[Web API] Error in health check:', error);
+        res.status(500).json({ success: false, error: 'Internal server error' });
+    }
 });
 app.post(`/telegram/${BOT_TOKEN}`, (req, res) => {
     bot.processUpdate(req.body);
@@ -509,18 +532,31 @@ async function handleCallbackQuery(callbackQuery) {
 }
 
 async function handleResultFromClient(data) {
-    const { clientId, type, payload, error, requestId } = data;
+    const { clientId, type, payload, error } = data;
     const clientName = clients.get(clientId)?.name || 'Unknown Client';
 
-    // ⭐ Handle Web API requests FIRST
-    if (requestId) {
-        const webRequest = cache.get(`web_request:${requestId}`);
-        if (webRequest && webRequest.res) {
-            const { res } = webRequest;
-            cache.del(`web_request:${requestId}`); // Clean up
-            
-            console.log(`[Web API] Received response for request ${requestId} from ${clientName}`);
-            
+    // ⭐ חפש בקש web pending לפי clientId (ללא requestId)
+    const webRequestKeys = cache.keys().filter(key => key.startsWith('web_request:'));
+    let webRequest = null;
+    let webRequestKey = null;
+
+    for (const key of webRequestKeys) {
+        const request = cache.get(key);
+        if (request && request.clientId === clientId && !request.res.headersSent) {
+            webRequest = request;
+            webRequestKey = key;
+            break;
+        }
+    }
+
+    // ⭐ אם מצאנו web request ממתין, טפל בו
+    if (webRequest && webRequest.res) {
+        const { res, type: expectedType } = webRequest;
+        cache.del(webRequestKey); // Clean up
+        
+        console.log(`[Web API] Received response from ${clientName} for ${expectedType}`);
+        
+        try {
             if (error) {
                 return res.json({ 
                     success: false, 
@@ -528,7 +564,7 @@ async function handleResultFromClient(data) {
                 });
             }
             
-            if (type === 'get_drives_result') {
+            if (type === 'get_drives_result' && expectedType === 'get_drives') {
                 return res.json({ 
                     success: true,
                     drives: payload.drives,
@@ -536,7 +572,7 @@ async function handleResultFromClient(data) {
                 });
             }
             
-            if (type === 'list_dir_result') {
+            if (type === 'list_dir_result' && expectedType === 'list_dir') {
                 return res.json({ 
                     success: true,
                     path: payload.path, 
@@ -545,7 +581,7 @@ async function handleResultFromClient(data) {
                 });
             }
             
-            if (type === 'get_file_result') {
+            if (type === 'get_file_result' && expectedType === 'get_file') {
                 const { fileName, fileData_base64 } = payload;
                 const fileBuffer = Buffer.from(fileData_base64, 'base64');
                 
@@ -555,13 +591,15 @@ async function handleResultFromClient(data) {
                 });
                 return res.send(fileBuffer);
             }
-        } else {
-            console.warn(`[Web API] No pending request found for ${requestId} (may have timed out)`);
+        } catch (resError) {
+            console.error('[Web API] Error sending response:', resError);
         }
-        return; // Don't continue to Telegram logic
+        
+        // אם הגענו לכאן, משהו לא תקין
+        return res.json({ success: false, error: 'Unexpected response type' });
     }
 
-    // ⭐ Rest of existing Telegram bot logic (unchanged)
+    // ⭐ אם לא מצאנו web request, זה טלגרם - לוגיקה קיימת
     const interaction = cache.get(`last_interaction:${clientId}`);
     if (!interaction || !interaction.messageId) {
         console.error(`CRITICAL: Could not find message_id for client response: ${clientId}`);
@@ -599,7 +637,6 @@ async function handleResultFromClient(data) {
         return bot.sendDocument(ADMIN_CHAT_ID, fileBuffer, {}, { filename: fileName, contentType: 'application/octet-stream' });
     }
 }
-
 
 async function showMainMenu(chatId, text = 'Welcome, Admin! This is the GeminiDesk control panel.', messageId = null) {
   cache.del(`active_message:${chatId}`); 
