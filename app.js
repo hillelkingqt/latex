@@ -551,10 +551,18 @@ function getStats() {
     return `📊 *GeminiDesk Analytics*\n\n*Total App Opens:* ${totalPings}\n\n*Opens by Version:*\n${versionStats}`;
 }
 
-// --- Scheduled Tasks ---
 cron.schedule('*/5 * * * *', () => {
     clients.forEach((client, clientId) => {
         if (client.ws.readyState === WebSocket.OPEN) {
+            // בדוק אם הלקוח עדיין חי לפני שליחת ping נוסף
+            if (client.isAlive === false) {
+                console.log(`[Cron] Client ${client.name} failed heartbeat. Terminating.`);
+                client.ws.terminate();
+                clients.delete(clientId);
+                return;
+            }
+            
+            client.isAlive = false;
             client.ws.ping(() => {});
         } else {
             clients.delete(clientId);
