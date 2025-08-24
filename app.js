@@ -35,6 +35,15 @@ function readCb(cbData) {
   return cache.get(`cb:${id}`);
 }
 
+function formatBytes(bytes, decimals = 2) {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+
 // --- Express App & HTTP Server Setup ---
 const app = express();
 const server = http.createServer(app);
@@ -391,8 +400,26 @@ function renderDirectoryView({ clientId, clientName, path, sort, page, chatId, m
     pageItems.forEach(item => {
         const icon = item.isDirectory ? '📁' : '📄';
         const action = item.isDirectory ? 'list_dir' : 'get_file';
-        const date = item.birthtime > 0 ? new Date(item.birthtime).toISOString().slice(0, 10) : 'no date';
-        const label = `${icon} ${item.name}  (${date})`;
+        
+        // ★★★ התיקון המרכזי: בניית מחרוזת הפרטים בצורה חכמה ★★★
+        const details = [];
+        // הוסף גודל רק אם זה קובץ
+        if (!item.isDirectory && item.size >= 0) {
+            details.push(formatBytes(item.size));
+        }
+        // הוסף תאריך אם הוא קיים
+        if (item.birthtime > 0) {
+            details.push(new Date(item.birthtime).toISOString().slice(0, 10));
+        }
+
+        let detailsString = '';
+        if (details.length > 0) {
+            detailsString = ` (${details.join(', ')})`;
+        }
+
+        const label = `${icon} ${item.name}${detailsString}`;
+        // ★★★ סוף התיקון ★★★
+
         keyboard.push([{ text: label, callback_data: makeCb(action, { clientId, path: item.path }) }]);
     });
 
@@ -411,6 +438,7 @@ function renderDirectoryView({ clientId, clientName, path, sort, page, chatId, m
     
     bot.editMessageText(messageText, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }).catch(console.error);
 }
+
 async function showClientList(chatId, messageId) {
     const clientKeys = cache.keys().filter(key => key.startsWith('client:'));
     const keyboard = [];
