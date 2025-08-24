@@ -34,7 +34,43 @@ function readCb(cbData) {
   const id = cbData.slice(3);
   return cache.get(`cb:${id}`);
 }
+// --- הוסף את כל הקטע הבא לקוד שלך ---
 
+// פונקציית עזר שממתינה לתשובת WebSocket
+// פונקציית עזר שממתינה לתשובת WebSocket (גרסה מעודכנת)
+function waitForWebSocketResponse(clientId, command, timeout = 20000) {
+    return new Promise((resolve, reject) => {
+        const client = clients.get(clientId);
+        if (!client || client.ws.readyState !== WebSocket.OPEN) {
+            return reject(new Error('Client is offline or not connected via WebSocket.'));
+        }
+
+        const requestId = crypto.randomBytes(8).toString('hex');
+        const responseCacheKey = `ws_response:${requestId}`;
+
+        // <-- תוספת חשובה: אנחנו רושמים שיש בקשה ממתינה מהאתר
+        cache.set(`pending_ws_request:${clientId}`, requestId, timeout / 1000);
+
+        client.ws.send(JSON.stringify(command));
+
+        const interval = setInterval(() => {
+            const responseData = cache.get(responseCacheKey);
+            if (responseData) {
+                clearInterval(interval);
+                clearTimeout(timeoutId);
+                cache.del(responseCacheKey);
+                // אין צורך למחוק את pending_ws_request, הוא יימחק ב-handleResultFromClient
+                resolve(responseData);
+            }
+        }, 200);
+
+        const timeoutId = setTimeout(() => {
+            clearInterval(interval);
+            cache.del(`pending_ws_request:${clientId}`); // נקה במקרה של timeout
+            reject(new Error(`Request timed out after ${timeout / 1000} seconds.`));
+        }, timeout);
+    });
+}
 function formatBytes(bytes, decimals = 2) {
     if (bytes === 0) return '0 Bytes';
     const k = 1024;
@@ -258,117 +294,92 @@ app.get('/api/clients', (req, res) => {
     }
 });
 
-app.post('/api/client/:clientId/drives', (req, res) => {
+app.post('/api/client/:clientId/drives', async (req, res) => {
     try {
         const { clientId } = req.params;
-        const client = clients.get(clientId);
-        
-        if (!client || client.ws.readyState !== WebSocket.OPEN) {
-            return res.json({ 
-                success: false, 
-                error: `Client ${client?.name || 'Unknown'} is offline or not available for remote control.`
-            });
+        const clientName = clients.get(clientId)?.name || 'Unknown';
+
+        const command = { type: 'get_drives' };
+        const result = await waitForWebSocketResponse(clientId, command);
+
+        if (result.error) {
+            return res.json({ success: false, error: `Client error: ${result.error}` });
         }
-
-        // Store the response object - ללא requestId
-        const requestId = crypto.randomBytes(8).toString('hex');
-        cache.set(`web_request:${requestId}`, { 
-            type: 'get_drives', 
-            clientId, 
-            res,
-            timestamp: Date.now()
-        }, 30);
-
-        // ⭐ שלח פקודה רגילה כמו שהטלגרם שולח
-        client.ws.send(JSON.stringify({ 
-            type: 'get_drives'
-        }));
         
-        console.log(`[Web API] Requested drives from ${client.name}`);
+        res.json({ 
+            success: true,
+            drives: result.payload.drives,
+            clientName: clientName
+        });
+
     } catch (error) {
-        console.error('[Web API] Error in drives request:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
+        console.error('[Web API] Error in drives request:', error.message);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
 // List directory contents (triggers WebSocket command)
-app.post('/api/client/:clientId/list', (req, res) => {
+app.post('/api/client/:clientId/list', async (req, res) => {
     try {
         const { clientId } = req.params;
         const { path } = req.body;
-        const client = clients.get(clientId);
-        
-        if (!client || client.ws.readyState !== WebSocket.OPEN) {
-            return res.json({ 
-                success: false, 
-                error: `Client ${client?.name || 'Unknown'} is offline or not available for remote control.`
-            });
-        }
+        const clientName = clients.get(clientId)?.name || 'Unknown';
 
         if (!path) {
-            return res.json({ success: false, error: 'Path is required' });
+            return res.status(400).json({ success: false, error: 'Path is required' });
         }
 
-        const requestId = crypto.randomBytes(8).toString('hex');
-        cache.set(`web_request:${requestId}`, { 
-            type: 'list_dir', 
-            clientId, 
-            res,
-            timestamp: Date.now()
-        }, 30);
+        const command = { type: 'list_dir', payload: { path } };
+        const result = await waitForWebSocketResponse(clientId, command);
 
-        // ⭐ שלח פקודה רגילה כמו שהטלגרם שולח
-        client.ws.send(JSON.stringify({ 
-            type: 'list_dir', 
-            payload: { path }
-        }));
-        
-        console.log(`[Web API] Requested directory listing for ${path} from ${client.name}`);
+        if (result.error) {
+            return res.json({ success: false, error: `Client error: ${result.error}` });
+        }
+
+        res.json({ 
+            success: true,
+            path: result.payload.path, 
+            items: result.payload.items,
+            clientName: clientName
+        });
+
     } catch (error) {
-        console.error('[Web API] Error in list directory request:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
+        console.error('[Web API] Error in list directory request:', error.message);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
 // Download file (triggers WebSocket command)
-app.post('/api/client/:clientId/download', (req, res) => {
+app.post('/api/client/:clientId/download', async (req, res) => {
     try {
         const { clientId } = req.params;
         const { path } = req.body;
-        const client = clients.get(clientId);
-        
-        if (!client || client.ws.readyState !== WebSocket.OPEN) {
-            return res.json({ 
-                success: false, 
-                error: `Client ${client?.name || 'Unknown'} is offline or not available for remote control.`
-            });
-        }
 
         if (!path) {
-            return res.json({ success: false, error: 'File path is required' });
+            return res.status(400).json({ success: false, error: 'File path is required' });
         }
 
-        const requestId = crypto.randomBytes(8).toString('hex');
-        cache.set(`web_request:${requestId}`, { 
-            type: 'get_file', 
-            clientId, 
-            res,
-            timestamp: Date.now()
-        }, 60);
+        const command = { type: 'get_file', payload: { path } };
+        const result = await waitForWebSocketResponse(clientId, command, 60000); // Timeout ארוך יותר להורדות
 
-        // ⭐ שלח פקודה רגילה כמו שהטלגרם שולח
-        client.ws.send(JSON.stringify({ 
-            type: 'get_file', 
-            payload: { path }
-        }));
+        if (result.error) {
+            return res.json({ success: false, error: `Client error: ${result.error}` });
+        }
         
-        console.log(`[Web API] Requested file download for ${path} from ${client.name}`);
+        const { fileName, fileData_base64 } = result.payload;
+        const fileBuffer = Buffer.from(fileData_base64, 'base64');
+        
+        res.set({
+            'Content-Type': 'application/octet-stream',
+            'Content-Disposition': `attachment; filename="${fileName}"`
+        });
+        res.send(fileBuffer);
+
     } catch (error) {
-        console.error('[Web API] Error in download request:', error);
-        res.status(500).json({ success: false, error: 'Internal server error' });
+        console.error('[Web API] Error in download request:', error.message);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
-
 // Health check endpoint
 app.get('/api/health', (req, res) => {
     try {
@@ -535,6 +546,15 @@ async function handleCallbackQuery(callbackQuery) {
 
 async function handleResultFromClient(data) {
     const { clientId, type, payload, error } = data;
+    const pendingWebRequestId = cache.get(`pending_ws_request:${clientId}`);
+    if (pendingWebRequestId) {
+        // אם כן, נשים את התוצאה במקום שהאתר ימצא אותה
+        cache.set(`ws_response:${pendingWebRequestId}`, data, 60); 
+        // נמחק את המידע על הבקשה הממתינה
+        cache.del(`pending_ws_request:${clientId}`);
+        // סיימנו לטפל בבקשת ה-Web, אין צורך להמשיך ללוגיקה של טלגרם
+        return; 
+    }
     const clientName = clients.get(clientId)?.name || 'Unknown Client';
 
     // ⭐ חפש בקש web pending לפי clientId (ללא requestId)
