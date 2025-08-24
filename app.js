@@ -369,11 +369,13 @@ app.post('/api/client/:clientId/download', async (req, res) => {
         const { fileName, fileData_base64 } = result.payload;
         const fileBuffer = Buffer.from(fileData_base64, 'base64');
         
-        res.set({
-            'Content-Type': 'application/octet-stream',
-            'Content-Disposition': `attachment; filename="${fileName}"`
-        });
-        res.send(fileBuffer);
+const encodedFileName = encodeURIComponent(fileName);
+res.set({
+    'Content-Type': 'application/octet-stream',
+    // אנחנו מספקים גם שם קובץ פשוט לדפדפנים ישנים, וגם את הגרסה המקודדת שתומכת בכל השפות
+    'Content-Disposition': `attachment; filename="download"; filename*=UTF-8''${encodedFileName}`
+});
+res.send(fileBuffer);
 
     } catch (error) {
         console.error('[Web API] Error in download request:', error.message);
