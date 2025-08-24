@@ -239,7 +239,8 @@ async function handleCallbackQuery(callbackQuery) {
     const short = readCb(data);
     
     if (short) {
-        const { action, clientId, path, sort, page } = short;
+        // --- התיקון כאן: הוספנו את hideFolders ---
+        const { action, clientId, path, sort, page, hideFolders } = short;
 
         // פעולות הדורשות תקשורת חיה עם הלקוח
         if (['select_client', 'list_dir', 'get_file'].includes(action)) {
@@ -251,7 +252,6 @@ async function handleCallbackQuery(callbackQuery) {
                 });
             }
 
-            // ★★★ התיקון: שומרים את ה-message_id לפני שליחת הפקודה ★★★
             cache.set(`last_interaction:${clientId}`, { messageId: message.message_id });
 
             let command;
@@ -276,16 +276,20 @@ async function handleCallbackQuery(callbackQuery) {
         else if (action === 'render_cached_list') {
             const clientName = clients.get(clientId)?.name || 'Unknown';
             return renderDirectoryView({ 
-                clientId, clientName, path, 
+                clientId, 
+                clientName, 
+                path, 
                 sort: sort || 'name_asc', 
                 page: page || 1, 
+                // --- התיקון כאן: מעבירים את hideFolders הלאה ---
+                hideFolders: hideFolders, 
                 chatId: message.chat.id, 
                 messageId: message.message_id 
             });
         }
     }
 
-    // --- Main Menu & Other Actions (נשאר ללא שינוי) ---
+    // Main Menu & Other Actions (נשאר ללא שינוי)
     switch (data.split(':')[0]) {
         case 'manage_clients': return showClientList(message.chat.id, message.message_id);
         case 'broadcast_menu': return showBroadcastMenu(message.chat.id, message.message_id);
@@ -308,7 +312,6 @@ async function handleCallbackQuery(callbackQuery) {
             return bot.editMessageText(prompt, { chat_id: message.chat.id, message_id: message.message_id, reply_markup: { inline_keyboard: [[{ text: '‹ Cancel', callback_data: 'broadcast_menu' }]] }});
     }
 }
-
 
 // 2. פונקציית הטיפול בתשובה מהלקוח (handleResultFromClient) המתוקנת
 async function handleResultFromClient(data) {
