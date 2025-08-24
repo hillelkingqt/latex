@@ -66,20 +66,25 @@ app.set('trust proxy', true);
 wss.on('connection', (ws, req) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const clientId = url.searchParams.get('clientId');
-    const clientName = url.searchParams.get('clientName');
+    
+    // --- התיקון כאן: פענוח השם המקודד מהלקוח ---
+    const clientNameRaw = url.searchParams.get('clientName');
+    const clientName = clientNameRaw ? decodeURIComponent(clientNameRaw) : 'Unknown';
 
-    if (!clientId || !clientName) {
-        console.error('[WebSocket] Connection attempt with missing info. Terminating.');
+    if (!clientId) {
+        console.error('[WebSocket] Connection attempt with missing client ID. Terminating.');
         return ws.terminate();
+    }
+
+    // --- שיפור: טיפול בחיבור מחדש (התנתקות החיבור הישן) ---
+    if (clients.has(clientId)) {
+        console.log(`[WebSocket] Re-connection detected for ${clientName}. Terminating old connection.`);
+        clients.get(clientId).ws.terminate();
     }
     
     console.log(`[WebSocket] Client Connected: ${clientName} (ID: ${clientId.substring(0, 8)}...)`);
     clients.set(clientId, { ws, name: clientName });
-    cache.set(`client:${clientId}`, { name: clientName }, 120);
-
-    const presenceInterval = setInterval(() => {
-        cache.set(`client:${clientId}`, { name: clientName }, 120);
-    }, 60 * 1000);
+    cache.set(`client:${clientId}`, { name: clientName }, 120); // שמירת נוכחות ראשונית
 
     ws.on('message', (message) => {
         try {
@@ -94,7 +99,7 @@ wss.on('connection', (ws, req) => {
     ws.on('close', () => {
         console.log(`[WebSocket] Client Disconnected: ${clientName} (ID: ${clientId.substring(0, 8)}...)`);
         clients.delete(clientId);
-        clearInterval(presenceInterval);
+        // אין צורך למחוק את ה-cache כאן, הוא יפוג מעצמו
     });
 
     ws.on('error', (error) => {
