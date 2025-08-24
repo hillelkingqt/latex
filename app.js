@@ -212,25 +212,39 @@ async function handleCallbackQuery(callbackQuery) {
     if (short) {
         const { action, clientId, path, sort, page } = short;
 
-        if (action === 'get_file') {
-             const client = clients.get(clientId);
-             if (!client || client.ws.readyState !== WebSocket.OPEN) { /* ... error handling ... */ }
-             const command = { type: 'get_file', payload: { path } };
-             client.ws.send(JSON.stringify(command));
-             return bot.editMessageText(`Requesting file: \`${path}\``, { chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown' });
-        }
-
-        // ★★★ התיקון המרכזי: לוגיקה חדשה ויעילה ★★★
-        if (action === 'list_dir') {
-            // זו בקשה לתיקייה חדשה, אז נבקש מהלקוח
+        // ★★★ התיקון: מבנה if / else if מסודר שמטפל בכל המקרים ★★★
+        
+        // פעולות הדורשות תקשורת חיה עם הלקוח
+        if (['select_client', 'list_dir', 'get_file'].includes(action)) {
             const client = clients.get(clientId);
-            if (!client || client.ws.readyState !== WebSocket.OPEN) { /* ... error handling ... */ }
-            const command = { type: 'list_dir', payload: { path } }; // אין צורך לשלוח מיון/עמוד
-            client.ws.send(JSON.stringify(command));
-            return bot.editMessageText(`Fetching directory: \`${path}\`...`, { chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown' });
+            if (!client || client.ws.readyState !== WebSocket.OPEN) {
+                return bot.editMessageText(`❌ Client *${client?.name || 'Unknown'}* is offline.`, {
+                    chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown',
+                    reply_markup: { inline_keyboard: [[{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]] }
+                });
+            }
 
-        } else if (action === 'render_cached_list') {
-            // זו בקשת מיון/דפדוף, נטפל בה מה-cache בלי לפנות ללקוח
+            let command;
+            let feedbackText;
+
+            if (action === 'select_client') {
+                // זה החלק שהיה חסר!
+                command = { type: 'get_drives' };
+                feedbackText = `Requesting drives from *${client.name}*...`;
+            } else if (action === 'list_dir') {
+                command = { type: 'list_dir', payload: { path } };
+                feedbackText = `Fetching directory: \`${path}\`...`;
+            } else if (action === 'get_file') {
+                command = { type: 'get_file', payload: { path } };
+                feedbackText = `Requesting file: \`${path}\``;
+            }
+
+            client.ws.send(JSON.stringify(command));
+            return bot.editMessageText(feedbackText, { chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown' });
+        
+        } 
+        // פעולה שמתבצעת כולה על השרת מה-cache
+        else if (action === 'render_cached_list') {
             const clientName = clients.get(clientId)?.name || 'Unknown';
             return renderDirectoryView({ 
                 clientId, clientName, path, 
