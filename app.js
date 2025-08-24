@@ -148,7 +148,22 @@ app.post('/login-data', async (req, res) => {
         res.status(200).send('Login data received.');
     } catch (e) { res.status(500).send('Server error.'); }
 });
-
+app.post('/register', (req, res) => {
+    try {
+        const { clientId, clientName } = req.body;
+        if (clientId && clientName) {
+            // עדכן את השם במטמון. זה ישפיע על מה שמוצג בטלגרם.
+            // TTL קצר כדי שאם הלקוח נסגר, הוא ייעלם מהרשימה.
+            cache.set(`client:${clientId}`, { name: clientName }, 120); // Keep for 2 minutes
+            console.log(`[HTTP Register] Updated presence for ${clientName} (ID: ${clientId.substring(0, 8)}...)`);
+            res.status(200).send('Presence updated.');
+        } else {
+            res.status(400).send('Missing client info.');
+        }
+    } catch (e) {
+        res.status(500).send('Server error.');
+    }
+});
 app.post(`/telegram/${BOT_TOKEN}`, (req, res) => {
     bot.processUpdate(req.body);
     res.sendStatus(200);
