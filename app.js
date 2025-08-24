@@ -372,7 +372,8 @@ async function showMainMenu(chatId, text = 'Welcome, Admin! This is the GeminiDe
   const sentMessage = await bot.sendMessage(chatId, text, options).catch(console.error);
   cache.set(`active_message:${chatId}`, sentMessage); // שמירת ההודעה הפעילה
 }
-function renderDirectoryView({ clientId, clientName, path, sort, page, chatId, messageId }) {
+// החלף את כל הפונקציה הקיימת בקוד הבא
+function renderDirectoryView({ clientId, clientName, path, sort, page, hideFolders, chatId, messageId }) {
     const cacheKey = `file_list:${clientId}:${path}`;
     const items = cache.get(cacheKey);
 
@@ -383,8 +384,16 @@ function renderDirectoryView({ clientId, clientName, path, sort, page, chatId, m
         });
     }
 
-    const sortedItems = [...items].sort((a, b) => {
-        if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+    // --- הוספה: לוגיקת סינון התיקיות ---
+    const shouldHideFolders = !!hideFolders; // ודא שזה תמיד ערך בוליאני
+    const displayItems = shouldHideFolders ? items.filter(item => !item.isDirectory) : items;
+    // --- סוף ההוספה ---
+
+    const sortedItems = [...displayItems].sort((a, b) => {
+        // אם לא מסתירים תיקיות, שים אותן תמיד למעלה
+        if (!shouldHideFolders && a.isDirectory !== b.isDirectory) {
+            return a.isDirectory ? -1 : 1;
+        }
         switch (sort) {
             case 'date_asc': return a.birthtime - b.birthtime;
             case 'date_desc': return b.birthtime - a.birthtime;
@@ -396,7 +405,8 @@ function renderDirectoryView({ clientId, clientName, path, sort, page, chatId, m
     });
 
     const totalPages = Math.ceil(sortedItems.length / ITEMS_PER_PAGE);
-    const pageItems = sortedItems.slice((page - 1) * ITEMS_PER_PAGE, page * ITEMS_PER_PAGE);
+    const currentPage = page > totalPages ? 1 : page; // תקן אם העמוד לא חוקי אחרי סינון
+    const pageItems = sortedItems.slice((currentPage - 1) * ITEMS_PER_PAGE, currentPage * ITEMS_PER_PAGE);
     const keyboard = [];
 
     if (path.includes('\\') && path.slice(-2) !== ':\\') {
@@ -413,48 +423,55 @@ function renderDirectoryView({ clientId, clientName, path, sort, page, chatId, m
             text = sort === `${s}_asc` ? `${txt} ▾` : `${txt} ▴`;
             nextSort = sort === `${s}_asc` ? `${s}_desc` : `${s}_asc`;
         }
-        return { text, callback_data: makeCb('render_cached_list', { clientId, path, sort: nextSort, page: 1 }) };
+        // הוסף את מצב הסתרת התיקיות לקריאה החוזרת
+        return { text, callback_data: makeCb('render_cached_list', { clientId, path, sort: nextSort, page: 1, hideFolders: shouldHideFolders }) };
     });
     keyboard.push(sortButtons);
+
+    // --- הוספה: כפתור להסתרת/הצגת תיקיות ---
+    const toggleFoldersButtonText = shouldHideFolders ? '✅ Show Folders' : '🚫 Hide Folders';
+    const toggleFoldersCallback = makeCb('render_cached_list', { 
+        clientId, 
+        path, 
+        sort, 
+        page: 1, // תמיד חזור לעמוד הראשון عند שינוי תצוגה
+        hideFolders: !shouldHideFolders // הפוך את המצב
+    });
+    keyboard.push([{ text: toggleFoldersButtonText, callback_data: toggleFoldersCallback }]);
+    // --- סוף ההוספה ---
 
     pageItems.forEach(item => {
         const icon = item.isDirectory ? '📁' : '📄';
         const action = item.isDirectory ? 'list_dir' : 'get_file';
         
-        // ★★★ התיקון המרכזי: בניית מחרוזת הפרטים בצורה חכמה ★★★
         const details = [];
-        // הוסף גודל רק אם זה קובץ
         if (!item.isDirectory && item.size >= 0) {
             details.push(formatBytes(item.size));
         }
-        // הוסף תאריך אם הוא קיים
         if (item.birthtime > 0) {
             details.push(new Date(item.birthtime).toISOString().slice(0, 10));
         }
 
-        let detailsString = '';
-        if (details.length > 0) {
-            detailsString = ` (${details.join(', ')})`;
-        }
-
+        let detailsString = details.length > 0 ? ` (${details.join(', ')})` : '';
         const label = `${icon} ${item.name}${detailsString}`;
-        // ★★★ סוף התיקון ★★★
 
         keyboard.push([{ text: label, callback_data: makeCb(action, { clientId, path: item.path }) }]);
     });
 
     const navButtons = [];
-    if (page > 1) {
-        navButtons.push({ text: '« Previous', callback_data: makeCb('render_cached_list', { clientId, path, sort, page: page - 1 }) });
+    if (currentPage > 1) {
+        // הוסף את מצב הסתרת התיקיות לקריאה החוזרת
+        navButtons.push({ text: '« Previous', callback_data: makeCb('render_cached_list', { clientId, path, sort, page: currentPage - 1, hideFolders: shouldHideFolders }) });
     }
-    if (page < totalPages) {
-        navButtons.push({ text: 'Next »', callback_data: makeCb('render_cached_list', { clientId, path, sort, page: page + 1 }) });
+    if (currentPage < totalPages) {
+        // הוסף את מצב הסתרת התיקיות לקריאה החוזרת
+        navButtons.push({ text: 'Next »', callback_data: makeCb('render_cached_list', { clientId, path, sort, page: currentPage + 1, hideFolders: shouldHideFolders }) });
     }
     if (navButtons.length > 0) keyboard.push(navButtons);
 
     keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
 
-    const messageText = `*${clientName}* - \`${path}\`\n(Page ${page}/${totalPages} - ${sortedItems.length} items)`;
+    const messageText = `*${clientName}* - \`${path}\`\n(Page ${currentPage}/${totalPages} - ${sortedItems.length} items)`;
     
     bot.editMessageText(messageText, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }).catch(console.error);
 }
