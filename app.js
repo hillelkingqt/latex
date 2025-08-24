@@ -203,6 +203,7 @@ async function handleMessage(message) {
     return showMainMenu(chat.id);
 }
 
+// --- התיקון (הדבק את כל הפונקציה הזו במקום הקודמת) ---
 async function handleCallbackQuery(callbackQuery) {
     const { from, message, data } = callbackQuery;
     
@@ -227,7 +228,8 @@ async function handleCallbackQuery(callbackQuery) {
                  command = { type: 'get_drives' };
                  feedbackText = `Requesting drives from *${clients.get(clientId).name}*...`;
             } else if (action === 'list_dir') {
-                command = { type: 'list_dir', payload: { path } };
+                // ★★★ התיקון: אנחנו שולחים ללקוח את המיון והעמוד המבוקש ★★★
+                command = { type: 'list_dir', payload: { path, sort, page } }; 
                 feedbackText = `Listing: \`${path}\`...`;
             } else if (action === 'get_file') {
                 command = { type: 'get_file', payload: { path } };
@@ -235,9 +237,10 @@ async function handleCallbackQuery(callbackQuery) {
             }
 
             client.ws.send(JSON.stringify(command));
-            // Only show loading message if it's not a sort/page change
-            if (!sort && !page) {
-                return bot.editMessageText(feedbackText, {
+
+            // ★★★ התיקון: תמיד נציג הודעת "טוען" כדי שהמשתמש ידע שהכפתור עבד ★★★
+            if (action !== 'get_file') { // Don't show for file download
+                 return bot.editMessageText(feedbackText, {
                     chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown'
                 });
             }
@@ -274,8 +277,9 @@ async function handleCallbackQuery(callbackQuery) {
 }
 
 // --- Result Handling from Clients ---
+// --- התיקון (הדבק את כל הפונקציה הזו במקום הקודמת) ---
 async function handleResultFromClient(data) {
-    const { clientId, type, payload, error } = data;
+    const { clientId, type, payload, error, originalPayload } = data;
     const clientName = clients.get(clientId)?.name || 'Unknown Client';
 
     if (error) {
@@ -287,22 +291,19 @@ async function handleResultFromClient(data) {
         const keyboard = drives.map(drive => [
           { text: `💽 ${drive}`, callback_data: makeCb('list_dir', { clientId, path: drive }) }
         ]);
-        // ★★★ תיקון הבאג של הכפתור הכפול ★★★
         keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
         return bot.sendMessage(ADMIN_CHAT_ID, `Select a drive to browse on *${clientName}*:`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard }});
     }
 
     if (type === 'list_dir_result') {
-        // ★★★ כל הלוגיקה החדשה של המיון והדפדוף נמצאת כאן ★★★
         const { path: currentPath, items } = payload;
-        const cbData = readCb(cache.keys().find(k => k.startsWith('cb:') && cache.get(k).path === currentPath));
-        
-        const page = cbData?.page || 1;
-        const currentSort = cbData?.sort || 'name_asc';
+
+        // ★★★ התיקון: אנחנו קוראים את המיון והעמוד מהמידע שהלקוח החזיר לנו ★★★
+        const page = originalPayload?.page || 1;
+        const currentSort = originalPayload?.sort || 'name_asc';
 
         // 1. לוגיקת המיון
         const sortedItems = [...items].sort((a, b) => {
-            // תמיד הצג תיקיות לפני קבצים
             if (a.isDirectory !== b.isDirectory) {
                 return a.isDirectory ? -1 : 1;
             }
@@ -312,8 +313,7 @@ async function handleResultFromClient(data) {
                 case 'size_asc': return a.size - b.size;
                 case 'size_desc': return b.size - a.size;
                 case 'name_desc': return b.name.localeCompare(a.name);
-                default: // name_asc
-                    return a.name.localeCompare(b.name);
+                default: return a.name.localeCompare(b.name);
             }
         });
 
@@ -321,11 +321,9 @@ async function handleResultFromClient(data) {
         const totalPages = Math.ceil(sortedItems.length / ITEMS_PER_PAGE);
         const startIndex = (page - 1) * ITEMS_PER_PAGE;
         const pageItems = sortedItems.slice(startIndex, startIndex + ITEMS_PER_PAGE);
-
         const keyboard = [];
 
         // 3. בניית המקלדת
-        // כפתור "עלה תיקייה" (Go Up)
         if (currentPath.includes('\\') && currentPath.slice(-2) !== ':\\') {
             const parentDir = currentPath.substring(0, currentPath.lastIndexOf('\\')) || currentPath.slice(0, 3);
             keyboard.push([
@@ -333,7 +331,6 @@ async function handleResultFromClient(data) {
             ]);
         }
 
-        // כפתורי מיון
         const sortButtons = [
             { text: currentSort === 'name_asc' ? 'Name ▾' : (currentSort === 'name_desc' ? 'Name ▴' : 'Name'), sort: currentSort.startsWith('name') ? (currentSort === 'name_asc' ? 'name_desc' : 'name_asc') : 'name_asc'},
             { text: currentSort === 'date_asc' ? 'Date ▾' : (currentSort === 'date_desc' ? 'Date ▴' : 'Date'), sort: currentSort.startsWith('date') ? (currentSort === 'date_asc' ? 'date_desc' : 'date_asc') : 'date_desc'},
@@ -344,18 +341,17 @@ async function handleResultFromClient(data) {
             callback_data: makeCb('list_dir', { clientId, path: currentPath, sort: b.sort, page: 1 })
         })));
         
-        // רשימת הקבצים והתיקיות לעמוד הנוכחי
         for (const item of pageItems) {
             const icon = item.isDirectory ? '📁' : '📄';
             const action = item.isDirectory ? 'list_dir' : 'get_file';
-            const date = item.birthtime > 0 ? new Date(item.birthtime).toISOString().slice(0, 10) : '';
+            // ★★★ התיקון: מוודא שהתאריך יוצג נכון ★★★
+            const date = item.birthtime > 0 ? new Date(item.birthtime).toISOString().slice(0, 10) : 'no date';
             const label = `${icon} ${item.name}  (${date})`;
             keyboard.push([
                 { text: label, callback_data: makeCb(action, { clientId, path: item.path }) }
             ]);
         }
         
-        // כפתורי דפדוף (Next/Previous)
         const navButtons = [];
         if (page > 1) {
             navButtons.push({ text: '« Previous', callback_data: makeCb('list_dir', { clientId, path: currentPath, sort: currentSort, page: page - 1 }) });
@@ -388,7 +384,6 @@ async function handleResultFromClient(data) {
     }
 }
 
-// --- Menu Display Functions ---
 
 async function showMainMenu(chatId, text = 'Welcome, Admin! This is the GeminiDesk control panel.', messageId = null) {
   cache.del(`active_message:${chatId}`); // נקה את הודעת הדפדפן האקטיבית
