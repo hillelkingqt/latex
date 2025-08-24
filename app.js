@@ -66,15 +66,17 @@ app.set('trust proxy', true);
 wss.on('connection', (ws, req) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const clientId = url.searchParams.get('clientId');
-        ws.isAlive = true;
+    
+    // --- התיקון כאן: פענוח השם המקודד מהלקוח ---
+    const clientNameRaw = url.searchParams.get('clientName');
+    const clientName = clientNameRaw ? decodeURIComponent(clientNameRaw) : 'Unknown';
+    
+    ws.isAlive = true;
     
     ws.on('pong', () => {
         ws.isAlive = true;
         console.log(`[WebSocket] Received pong from ${clientName}`);
     });
-    // --- התיקון כאן: פענוח השם המקודד מהלקוח ---
-    const clientNameRaw = url.searchParams.get('clientName');
-    const clientName = clientNameRaw ? decodeURIComponent(clientNameRaw) : 'Unknown';
 
     if (!clientId) {
         console.error('[WebSocket] Connection attempt with missing client ID. Terminating.');
