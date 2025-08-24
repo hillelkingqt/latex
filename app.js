@@ -212,8 +212,6 @@ async function handleCallbackQuery(callbackQuery) {
     if (short) {
         const { action, clientId, path, sort, page } = short;
 
-        // ★★★ התיקון: מבנה if / else if מסודר שמטפל בכל המקרים ★★★
-        
         // פעולות הדורשות תקשורת חיה עם הלקוח
         if (['select_client', 'list_dir', 'get_file'].includes(action)) {
             const client = clients.get(clientId);
@@ -224,11 +222,13 @@ async function handleCallbackQuery(callbackQuery) {
                 });
             }
 
+            // ★★★ התיקון: שומרים את ה-message_id לפני שליחת הפקודה ★★★
+            cache.set(`last_interaction:${clientId}`, { messageId: message.message_id });
+
             let command;
             let feedbackText;
 
             if (action === 'select_client') {
-                // זה החלק שהיה חסר!
                 command = { type: 'get_drives' };
                 feedbackText = `Requesting drives from *${client.name}*...`;
             } else if (action === 'list_dir') {
@@ -281,41 +281,40 @@ async function handleCallbackQuery(callbackQuery) {
 }
 
 
-// --- Result Handling from Clients ---
-// --- התיקון (הדבק את כל הפונקציה הזו במקום הקודמת) ---
+// 2. פונקציית הטיפול בתשובה מהלקוח (handleResultFromClient) המתוקנת
 async function handleResultFromClient(data) {
     const { clientId, type, payload, error, originalPayload } = data;
     const clientName = clients.get(clientId)?.name || 'Unknown Client';
 
+    // ★★★ התיקון: שולפים את ה-message_id שנשמר במיוחד עבור הבקשה הזו ★★★
+    const interaction = cache.get(`last_interaction:${clientId}`);
+    if (!interaction || !interaction.messageId) {
+        console.error(`CRITICAL: Could not find message_id for client response: ${clientId}`);
+        // במקרה חירום, שלח הודעה חדשה במקום לקרוס
+        return bot.sendMessage(ADMIN_CHAT_ID, "An unexpected error occurred (missing interaction context). Please try again from the main menu.");
+    }
+    const messageId = interaction.messageId;
+
     if (error) {
-        return bot.sendMessage(ADMIN_CHAT_ID, `Client Error on *${clientName}*:\n\`\`\`\n${error}\n\`\`\``, { parse_mode: 'Markdown' });
+        return bot.editMessageText(`Client Error on *${clientName}*:\n\`\`\`\n${error}\n\`\`\``, { chat_id: ADMIN_CHAT_ID, message_id: messageId, parse_mode: 'Markdown' });
     }
 
     if (type === 'get_drives_result') {
         const drives = payload.drives;
         const keyboard = drives.map(drive => [{ text: `💽 ${drive}`, callback_data: makeCb('list_dir', { clientId, path: drive }) }]);
         keyboard.push([{ text: '‹ Back to Client List', callback_data: 'manage_clients' }]);
-        // ★★★ תיקון: נשתמש ב-editMessageText כדי לעדכן את הודעת ה"טוען" ★★★
-        const activeMessage = cache.get(`active_message:${ADMIN_CHAT_ID}`);
-        if(activeMessage){
-             return bot.editMessageText(`Select a drive to browse on *${clientName}*:`, { chat_id: ADMIN_CHAT_ID, message_id: activeMessage.message_id, parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard }});
-        }
-        return bot.sendMessage(ADMIN_CHAT_ID, `Select a drive to browse on *${clientName}*:`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard }});
+        return bot.editMessageText(`Select a drive to browse on *${clientName}*:`, { chat_id: ADMIN_CHAT_ID, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard }});
     }
 
     if (type === 'list_dir_result') {
         const { path: currentPath, items } = payload;
-
-        // ★★★ התיקון המרכזי: שומרים את הרשימה המלאה ב-cache לחמש דקות ★★★
         const cacheKey = `file_list:${clientId}:${currentPath}`;
-        cache.set(cacheKey, items, 300); // Cache for 5 minutes
+        cache.set(cacheKey, items, 300);
 
-        // ועכשיו קוראים לפונקציה שתציג את העמוד הראשון מה-cache
-        const activeMessage = cache.get(`active_message:${ADMIN_CHAT_ID}`);
         return renderDirectoryView({
             clientId, clientName, path: currentPath, 
             sort: 'name_asc', page: 1, 
-            chatId: ADMIN_CHAT_ID, messageId: activeMessage.message_id
+            chatId: ADMIN_CHAT_ID, messageId: messageId
         });
     }
     
