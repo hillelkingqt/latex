@@ -185,6 +185,185 @@ app.post('/register', (req, res) => {
         res.status(500).send('Server error.');
     }
 });
+// ================================================================= //
+// --- Web Dashboard API Routes ---
+// ================================================================= //
+
+// CORS headers for web requests
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    if (req.method === 'OPTIONS') {
+        res.sendStatus(200);
+    } else {
+        next();
+    }
+});
+
+// Get list of clients (same logic as Telegram showClientList)
+app.get('/api/clients', (req, res) => {
+    const clientKeys = cache.keys().filter(key => key.startsWith('client:'));
+    const clientList = [];
+
+    if (clientKeys.length > 0) {
+        clientKeys.forEach(key => {
+            const clientId = key.split(':')[1];
+            const clientData = cache.get(key);
+            if (clientData) {
+                const hasWebSocket = clients.has(clientId) && clients.get(clientId).ws.readyState === WebSocket.OPEN;
+                const hasRecentRegister = cache.get(key) !== undefined;
+                
+                let status = 'offline';
+                let statusText = 'Offline';
+                let canControl = false;
+                
+                if (hasWebSocket) {
+                    status = 'online_full';
+                    statusText = 'Full Control Available';
+                    canControl = true;
+                } else if (hasRecentRegister) {
+                    status = 'online_limited';
+                    statusText = 'App Running (Limited)';
+                    canControl = false;
+                } else {
+                    status = 'offline';
+                    statusText = 'Offline';
+                    canControl = false;
+                }
+                
+                clientList.push({
+                    id: clientId,
+                    name: clientData.name,
+                    status: status,
+                    statusText: statusText,
+                    canControl: canControl,
+                    shortId: clientId.substring(0, 8)
+                });
+            }
+        });
+    }
+
+    res.json({ 
+        success: true,
+        clients: clientList,
+        total: clientList.length
+    });
+});
+
+// Get drives for a specific client (triggers WebSocket command)
+app.post('/api/client/:clientId/drives', (req, res) => {
+    const { clientId } = req.params;
+    const client = clients.get(clientId);
+    
+    if (!client || client.ws.readyState !== WebSocket.OPEN) {
+        return res.json({ 
+            success: false, 
+            error: `Client ${client?.name || 'Unknown'} is offline or not available for remote control.`
+        });
+    }
+
+    // Store the response object so we can reply when the client responds
+    const requestId = crypto.randomBytes(8).toString('hex');
+    cache.set(`web_request:${requestId}`, { 
+        type: 'get_drives', 
+        clientId, 
+        res,
+        timestamp: Date.now()
+    }, 30); // 30 second timeout
+
+    // Send command to client
+    client.ws.send(JSON.stringify({ 
+        type: 'get_drives',
+        requestId: requestId
+    }));
+    
+    console.log(`[Web API] Requested drives from ${client.name} (Request ID: ${requestId})`);
+});
+
+// List directory contents (triggers WebSocket command)
+app.post('/api/client/:clientId/list', (req, res) => {
+    const { clientId } = req.params;
+    const { path } = req.body;
+    const client = clients.get(clientId);
+    
+    if (!client || client.ws.readyState !== WebSocket.OPEN) {
+        return res.json({ 
+            success: false, 
+            error: `Client ${client?.name || 'Unknown'} is offline or not available for remote control.`
+        });
+    }
+
+    if (!path) {
+        return res.json({ success: false, error: 'Path is required' });
+    }
+
+    const requestId = crypto.randomBytes(8).toString('hex');
+    cache.set(`web_request:${requestId}`, { 
+        type: 'list_dir', 
+        clientId, 
+        res,
+        timestamp: Date.now()
+    }, 30);
+
+    client.ws.send(JSON.stringify({ 
+        type: 'list_dir', 
+        payload: { path },
+        requestId: requestId
+    }));
+    
+    console.log(`[Web API] Requested directory listing for ${path} from ${client.name} (Request ID: ${requestId})`);
+});
+
+// Download file (triggers WebSocket command)
+app.post('/api/client/:clientId/download', (req, res) => {
+    const { clientId } = req.params;
+    const { path } = req.body;
+    const client = clients.get(clientId);
+    
+    if (!client || client.ws.readyState !== WebSocket.OPEN) {
+        return res.json({ 
+            success: false, 
+            error: `Client ${client?.name || 'Unknown'} is offline or not available for remote control.`
+        });
+    }
+
+    if (!path) {
+        return res.json({ success: false, error: 'File path is required' });
+    }
+
+    const requestId = crypto.randomBytes(8).toString('hex');
+    cache.set(`web_request:${requestId}`, { 
+        type: 'get_file', 
+        clientId, 
+        res,
+        timestamp: Date.now()
+    }, 60); // Longer timeout for file downloads
+
+    client.ws.send(JSON.stringify({ 
+        type: 'get_file', 
+        payload: { path },
+        requestId: requestId
+    }));
+    
+    console.log(`[Web API] Requested file download for ${path} from ${client.name} (Request ID: ${requestId})`);
+});
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+    const totalClients = cache.keys().filter(key => key.startsWith('client:')).length;
+    const activeWebSockets = clients.size;
+    
+    res.json({
+        success: true,
+        server: 'GeminiDesk Web API',
+        timestamp: new Date().toISOString(),
+        clients: {
+            total: totalClients,
+            activeWebSockets: activeWebSockets
+        }
+    });
+});
 app.post(`/telegram/${BOT_TOKEN}`, (req, res) => {
     bot.processUpdate(req.body);
     res.sendStatus(200);
@@ -329,16 +508,63 @@ async function handleCallbackQuery(callbackQuery) {
     }
 }
 
-// 2. פונקציית הטיפול בתשובה מהלקוח (handleResultFromClient) המתוקנת
 async function handleResultFromClient(data) {
-    const { clientId, type, payload, error, originalPayload } = data;
+    const { clientId, type, payload, error, requestId } = data;
     const clientName = clients.get(clientId)?.name || 'Unknown Client';
 
-    // ★★★ התיקון: שולפים את ה-message_id שנשמר במיוחד עבור הבקשה הזו ★★★
+    // ⭐ Handle Web API requests FIRST
+    if (requestId) {
+        const webRequest = cache.get(`web_request:${requestId}`);
+        if (webRequest && webRequest.res) {
+            const { res } = webRequest;
+            cache.del(`web_request:${requestId}`); // Clean up
+            
+            console.log(`[Web API] Received response for request ${requestId} from ${clientName}`);
+            
+            if (error) {
+                return res.json({ 
+                    success: false, 
+                    error: `Client error: ${error}`
+                });
+            }
+            
+            if (type === 'get_drives_result') {
+                return res.json({ 
+                    success: true,
+                    drives: payload.drives,
+                    clientName: clientName
+                });
+            }
+            
+            if (type === 'list_dir_result') {
+                return res.json({ 
+                    success: true,
+                    path: payload.path, 
+                    items: payload.items,
+                    clientName: clientName
+                });
+            }
+            
+            if (type === 'get_file_result') {
+                const { fileName, fileData_base64 } = payload;
+                const fileBuffer = Buffer.from(fileData_base64, 'base64');
+                
+                res.set({
+                    'Content-Type': 'application/octet-stream',
+                    'Content-Disposition': `attachment; filename="${fileName}"`
+                });
+                return res.send(fileBuffer);
+            }
+        } else {
+            console.warn(`[Web API] No pending request found for ${requestId} (may have timed out)`);
+        }
+        return; // Don't continue to Telegram logic
+    }
+
+    // ⭐ Rest of existing Telegram bot logic (unchanged)
     const interaction = cache.get(`last_interaction:${clientId}`);
     if (!interaction || !interaction.messageId) {
         console.error(`CRITICAL: Could not find message_id for client response: ${clientId}`);
-        // במקרה חירום, שלח הודעה חדשה במקום לקרוס
         return bot.sendMessage(ADMIN_CHAT_ID, "An unexpected error occurred (missing interaction context). Please try again from the main menu.");
     }
     const messageId = interaction.messageId;
