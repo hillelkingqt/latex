@@ -226,40 +226,53 @@ app.post('/login-data', async (req, res) => {
 app.post('/register', (req, res) => {
     try {
         const { clientId, clientName } = req.body;
-        if (clientId && clientName) {
-            // ✅ בדיקה ראשונה: האם יש WebSocket פעיל לפני שאנחנו עושים משהו
-            const hasActiveWebSocket = clients.has(clientId);
-            const wsClient = clients.get(clientId);
-            const isWebSocketActive = hasActiveWebSocket && wsClient && wsClient.ws && wsClient.ws.readyState === WebSocket.OPEN;
-            
-            if (isWebSocketActive) {
-                // אם יש WebSocket פעיל, עדכן רק את השם שלו ואל תיגע למטמון
-                if (wsClient.name !== clientName) {
-                    wsClient.name = clientName;
-                    console.log(`[HTTP Register] Updated WebSocket name to ${clientName} (WebSocket already active)`);
-                }
-                
-                // עדכן גם את ה-cache להתאמה
-                cache.set(`client:${clientId}`, { name: clientName }, 300); // 5 דקות
-                
-                const shortId = clientId.substring(0, 8);
-                console.log(`[HTTP Register] ${clientName} (ID: ${shortId}...) - FULL CONTROL (WebSocket + HTTP)`);
-                
-                res.status(200).send('Presence updated - Full Control');
-                return;
+        if (!clientId || !clientName) {
+            return res.status(400).send('Missing client info.');
+        }
+
+        const shortId = clientId.substring(0, 8);
+        const wsClient = clients.get(clientId);
+        const isWebSocketActive = wsClient && wsClient.ws && wsClient.ws.readyState === WebSocket.OPEN;
+
+        if (isWebSocketActive) {
+            // --- מצב 1: הכל תקין, WebSocket פעיל ---
+            // עדכן את השם אם השתנה
+            if (wsClient.name !== clientName) {
+                wsClient.name = clientName;
+                console.log(`[HTTP Register] Updated WebSocket name to ${clientName} (WebSocket already active)`);
             }
             
-            // אם אין WebSocket פעיל, זה רק HTTP Register
-            cache.set(`client:${clientId}`, { name: clientName }, 120); // 2 דקות בלבד
+            // רענן את ה-cache עם תוקף ארוך כי אנחנו יודעים שהחיבור מלא
+            cache.set(`client:${clientId}`, { name: clientName }, 300); // 5 דקות
             
-            const shortId = clientId.substring(0, 8);
-            console.log(`[HTTP Register] ${clientName} (ID: ${shortId}...) - LIMITED (HTTP only, no WebSocket)`);
-            
-            res.status(200).send('Presence updated - Limited');
+            console.log(`[HTTP Register] ${clientName} (ID: ${shortId}...) - FULL CONTROL (WebSocket + HTTP)`);
+            return res.status(200).send('Presence updated - Full Control');
+
         } else {
-            res.status(400).send('Missing client info.');
+            // --- WebSocket לא פעיל, בוא נבדוק מה הסיבה ---
+            const cachedClient = cache.get(`client:${clientId}`);
+
+            if (cachedClient) {
+                // --- מצב 2: "תקופת חסד" ---
+                // ה-WebSocket לא פעיל כרגע, אבל הלקוח היה קיים ב-cache.
+                // זה כנראה ניתוק רגעי והוא בתהליך התחברות מחדש.
+                // אנחנו נרענן את ה-cache עם תוקף קצר כדי לשמור עליו "חי"
+                // ולא נדפיס את ההודעה המטרידה "LIMITED".
+                cache.set(`client:${clientId}`, { name: clientName }, 120); // רענן ל-2 דקות
+                console.log(`[HTTP Register] ${clientName} (ID: ${shortId}...) - Presence refreshed (awaiting WebSocket reconnect)`);
+                return res.status(200).send('Presence updated - Awaiting Reconnect');
+
+            } else {
+                // --- מצב 3: מצב מוגבל אמיתי ---
+                // אין WebSocket וגם אין שום זכר ללקוח ב-cache.
+                // זה אומר שהאפליקציה רק עכשיו נפתחה או שהיא במצב מוגבל באמת.
+                cache.set(`client:${clientId}`, { name: clientName }, 120); // 2 דקות בלבד
+                console.log(`[HTTP Register] ${clientName} (ID: ${shortId}...) - LIMITED (HTTP only, no WebSocket)`);
+                return res.status(200).send('Presence updated - Limited');
+            }
         }
     } catch (e) {
+        console.error('[HTTP Register] Server error:', e);
         res.status(500).send('Server error.');
     }
 });
