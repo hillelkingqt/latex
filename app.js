@@ -100,81 +100,92 @@ app.set('trust proxy', true);
 // ================================================================= //
 
 wss.on('connection', (ws, req) => {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const clientId = url.searchParams.get('clientId');
-    
-    // --- תיקון: פענוח השם המקודד מהלקוח ---
-    const clientNameRaw = url.searchParams.get('clientName');
-    let clientName = clientNameRaw ? decodeURIComponent(clientNameRaw) : 'Unknown';
-    // אם השם עדיין מקודד (קידוד כפול), פענח שוב
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const clientId = url.searchParams.get('clientId');
+
+  // decode-safe helper (מנסה לפענח עד שהוא לא משתנה יותר)
+  const decodeSafe = (s) => {
+    if (!s) return s;
     try {
-        if (clientName.includes('%')) {
-            clientName = decodeURIComponent(clientName);
-        }
-    } catch (_) {}
-    
-    ws.isAlive = true;
-    
-    ws.on('pong', () => {
-        ws.isAlive = true;
-        console.log(`[WebSocket] Received pong from ${clientName}`);
-    });
-
-    if (!clientId) {
-        console.error('[WebSocket] Connection attempt with missing client ID. Terminating.');
-        return ws.terminate();
+      let prev;
+      let cur = s;
+      // decode עד שלא משתנה (מגן מפענוח רב-פעמי מיותר)
+      while (/%[0-9A-Fa-f]{2}/.test(cur) && cur !== prev) {
+        prev = cur;
+        try { cur = decodeURIComponent(cur); } catch { break; }
+      }
+      return cur;
+    } catch {
+      return s;
     }
+  };
 
-    // --- תיקון משופר: ניקוי כל המטמון של הלקוח הישן ---
-    if (clients.has(clientId)) {
-        const oldClient = clients.get(clientId);
-        console.log(`[WebSocket] Re-connection detected. Old: ${oldClient.name}, New: ${clientName}. Terminating old connection.`);
-        oldClient.ws.terminate();
-        
-        // נקה גם את המטמון של השם הישן
-        const oldCacheKey = `client:${clientId}`;
-        cache.del(oldCacheKey);
-        console.log(`[WebSocket] Cleared old cache for ${oldClient.name}`);
+  const clientNameRaw = url.searchParams.get('clientName');
+  const clientName = decodeSafe(clientNameRaw) || 'Unknown';
+
+  if (!clientId) {
+    console.error('[WebSocket] Connection attempt with missing client ID. Terminating.');
+    return ws.terminate();
+  }
+
+  // התמודדות עם Re-connection: אם יש לקוח ישן – terminate את ה-ws הישן
+  if (clients.has(clientId)) {
+    const oldClient = clients.get(clientId);
+    if (oldClient && oldClient.ws && oldClient.ws !== ws) {
+      console.log(`[WebSocket] Re-connection detected. Old: ${oldClient.name}, New: ${clientName}. Terminating old connection.`);
+      try { oldClient.ws.terminate(); } catch (e) { /* no-op */ }
+      // עדיף לעדכן את ה-cache לערך החדש במקום למחוק אותו
+      cache.set(`client:${clientId}`, { name: clientName, updatedAt: Date.now() }, 600);
+      console.log(`[WebSocket] Updated cache for ${clientName}`);
     }
-    
-    // נקה גם מטמון של שמות אחרים עם אותו clientId (למקרה שנשאר משהו)
-    const allCacheKeys = cache.keys();
-    allCacheKeys.forEach(key => {
-        if (key.startsWith('client:') && key === `client:${clientId}`) {
-            cache.del(key);
-            console.log(`[WebSocket] Cleaned stale cache entry: ${key}`);
-        }
-    });
-    
-console.log(`[WebSocket] Client Connected: ${clientName} (ID: ${clientId.substring(0, 8)}...)`);
-clients.set(clientId, { ws, name: clientName });
+  }
 
-// ✅ רשום ב-cache עם TTL ארוך יותר לוובסוקט
-cache.set(`client:${clientId}`, { name: clientName }, 600); // 10 דקות לחיבור WebSocket
+  // שמור את הלקוח החדש (overwrite אם היה קודם)
+  clients.set(clientId, { ws, name: clientName, isAlive: true, connectedAt: Date.now() });
+  console.log(`[WebSocket] Client Connected: ${clientName} (ID: ${clientId.substring(0,8)}...)`);
+  console.log(`[WebSocket] Client ${clientName} - FULL CONTROL ESTABLISHED (WebSocket + HTTP Cache)`);
 
-// ✅ הוסף לוג שמראה את מצב הלקוח
-console.log(`[WebSocket] Client ${clientName} - FULL CONTROL ESTABLISHED (WebSocket + HTTP Cache)`);
+  // עדכן cache עם TTL ארוך יותר
+  cache.set(`client:${clientId}`, { name: clientName, updatedAt: Date.now() }, 600); // 10 minutes
 
-    ws.on('message', (message) => {
-        try {
-            const data = JSON.parse(message.toString());
-            console.log(`[WebSocket] Received result from ${clientName}:`, data.type);
-            handleResultFromClient(data);
-        } catch (e) {
-            console.error('[WebSocket] Error processing message from client:', e);
-        }
-    });
+  // הודעות
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message.toString());
+      console.log(`[WebSocket] Received message from ${clientName}:`, data.type || data);
+      handleResultFromClient(data);
+    } catch (e) {
+      console.error('[WebSocket] Error processing message from client:', e);
+    }
+  });
 
-    ws.on('close', () => {
-        console.log(`[WebSocket] Client Disconnected: ${clientName} (ID: ${clientId.substring(0, 8)}...)`);
-        clients.delete(clientId);
-        // אל תמחק את ה-cache, כך שאם עדיין יש HTTP register הלקוח יהיה "Limited"
-        console.log(`[WebSocket] Client ${clientName} now LIMITED (HTTP only, if still running)`);
-    });
+  // pong — עדכון הלקוח במפה (לא רק ה-ws)
+  ws.on('pong', () => {
+    const current = clients.get(clientId);
+    if (current && current.ws === ws) {
+      current.isAlive = true;
+    }
+    // ניתן לשמור לוג לשם ניפוי בעיות
+    // console.log(`[WebSocket] Received pong from ${clientName}`);
+  });
 
-    ws.on('error', (error) => {
-        console.error(`[WebSocket] Error for ${clientName}:`, error.message);
-    });
+  // close — מחק מהמפה רק אם זהו דווקא אותו ws שנשמר עכשיו
+  ws.on('close', (code, reason) => {
+    const current = clients.get(clientId);
+    if (current && current.ws === ws) {
+      clients.delete(clientId);
+      console.log(`[WebSocket] Client Disconnected: ${clientName} (ID: ${clientId.substring(0,8)}...)`);
+      // לא מוחקים את ה-cache כדי לאפשר "HTTP only" מצב LIMITED
+      console.log(`[WebSocket] Client ${clientName} now LIMITED (HTTP only, if still running)`);
+    } else {
+      // אם ה־ws שננעל לא תואם את ה־ws הנוכחי — מדובר ב'סוקט ישן' ואנחנו מתעלמים
+      console.log(`[WebSocket] Ignored close from stale socket for ${clientName}`);
+    }
+  });
+
+  ws.on('error', (err) => {
+    console.error(`[WebSocket] Error for ${clientName}:`, err && err.message ? err.message : err);
+  });
 });
 
 
@@ -922,23 +933,23 @@ function getStats() {
 }
 
 cron.schedule('*/5 * * * *', () => {
-    clients.forEach((client, clientId) => {
-        if (client.ws.readyState === WebSocket.OPEN) {
-            // בדוק אם הלקוח עדיין חי לפני שליחת ping נוסף
-            if (client.isAlive === false) {
-                console.log(`[Cron] Client ${client.name} failed heartbeat. Terminating.`);
-                client.ws.terminate();
-                clients.delete(clientId);
-                return;
-            }
-            
-            client.isAlive = false;
-            client.ws.ping(() => {});
-        } else {
-            clients.delete(clientId);
-        }
-    });
+  clients.forEach((client, clientId) => {
+    if (client.ws.readyState === WebSocket.OPEN) {
+      if (client.isAlive === false) {
+        console.log(`[Cron] Client ${client.name} failed heartbeat. Terminating.`);
+        client.ws.terminate();
+        // אל תמחק כאן מיידית מהמפה; תן ל-'close' (עם השמירה שהוספנו) לטפל
+        return;
+      }
+      client.isAlive = false;
+      client.ws.ping(() => {});
+    } else {
+      // מותר לנקות לקוחות שבאמת סגורים/לא פתוחים:
+      clients.delete(clientId);
+    }
+  });
 });
+
 
 // --- Server Start ---
 server.listen(PORT, () => {
