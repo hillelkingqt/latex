@@ -823,9 +823,9 @@ async function showClientList(chatId, messageId) {
     const options = { chat_id: chatId, reply_markup: { inline_keyboard: keyboard } };
 
     if (messageId) {
-        await bot.editMessageText(text, { ...options, message_id: messageId }).catch(console.error);
+        bot.editMessageText(text, { ...options, message_id: messageId }).catch(console.error);
     } else {
-        await bot.sendMessage(chatId, text, options).catch(console.error);
+        bot.sendMessage(chatId, text, options).catch(console.error);
     }
 }
     
@@ -835,9 +835,9 @@ async function showClientList(chatId, messageId) {
     const options = { chat_id: chatId, reply_markup: { inline_keyboard: keyboard } };
 
     if (messageId) {
-        await bot.editMessageText(text, { ...options, message_id: messageId }).catch(console.error);
+        bot.editMessageText(text, { ...options, message_id: messageId }).catch(console.error);
     } else {
-        await bot.sendMessage(chatId, text, options).catch(console.error);
+        bot.sendMessage(chatId, text, options).catch(console.error);
     }
 }
 
