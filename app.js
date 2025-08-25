@@ -103,9 +103,15 @@ wss.on('connection', (ws, req) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const clientId = url.searchParams.get('clientId');
     
-    // --- התיקון כאן: פענוח השם המקודד מהלקוח ---
+    // --- תיקון: פענוח השם המקודד מהלקוח ---
     const clientNameRaw = url.searchParams.get('clientName');
-    const clientName = clientNameRaw ? decodeURIComponent(clientNameRaw) : 'Unknown';
+    let clientName = clientNameRaw ? decodeURIComponent(clientNameRaw) : 'Unknown';
+    // אם השם עדיין מקודד (קידוד כפול), פענח שוב
+    try {
+        if (clientName.includes('%')) {
+            clientName = decodeURIComponent(clientName);
+        }
+    } catch (_) {}
     
     ws.isAlive = true;
     
@@ -119,11 +125,26 @@ wss.on('connection', (ws, req) => {
         return ws.terminate();
     }
 
-    // --- שיפור: טיפול בחיבור מחדש (התנתקות החיבור הישן) ---
+    // --- תיקון משופר: ניקוי כל המטמון של הלקוח הישן ---
     if (clients.has(clientId)) {
-        console.log(`[WebSocket] Re-connection detected for ${clientName}. Terminating old connection.`);
-        clients.get(clientId).ws.terminate();
+        const oldClient = clients.get(clientId);
+        console.log(`[WebSocket] Re-connection detected. Old: ${oldClient.name}, New: ${clientName}. Terminating old connection.`);
+        oldClient.ws.terminate();
+        
+        // נקה גם את המטמון של השם הישן
+        const oldCacheKey = `client:${clientId}`;
+        cache.del(oldCacheKey);
+        console.log(`[WebSocket] Cleared old cache for ${oldClient.name}`);
     }
+    
+    // נקה גם מטמון של שמות אחרים עם אותו clientId (למקרה שנשאר משהו)
+    const allCacheKeys = cache.keys();
+    allCacheKeys.forEach(key => {
+        if (key.startsWith('client:') && key === `client:${clientId}`) {
+            cache.del(key);
+            console.log(`[WebSocket] Cleaned stale cache entry: ${key}`);
+        }
+    });
     
     console.log(`[WebSocket] Client Connected: ${clientName} (ID: ${clientId.substring(0, 8)}...)`);
     clients.set(clientId, { ws, name: clientName });
@@ -206,8 +227,20 @@ app.post('/register', (req, res) => {
     try {
         const { clientId, clientName } = req.body;
         if (clientId && clientName) {
-            // עדכן את השם במטמון לזמן ארוך יותר
-            cache.set(`client:${clientId}`, { name: clientName }, 300); // 5 דקות במקום 2
+            // נקה כל המטמון הישן של הלקוח הזה לפני עדכון
+            const allCacheKeys = cache.keys();
+            allCacheKeys.forEach(key => {
+                if (key.startsWith('client:') && key === `client:${clientId}`) {
+                    const oldData = cache.get(key);
+                    if (oldData && oldData.name !== clientName) {
+                        cache.del(key);
+                        console.log(`[HTTP Register] Cleared old cache for ${oldData.name}`);
+                    }
+                }
+            });
+            
+            // עדכן את השם במטמון
+            cache.set(`client:${clientId}`, { name: clientName }, 120); // Keep for 2 minutes
             
             // ✅ לוג משופר
             const shortId = clientId.substring(0, 8);
@@ -215,13 +248,16 @@ app.post('/register', (req, res) => {
             
             // ✅ בדיקה אם יש גם WebSocket
             const hasWebSocket = clients.has(clientId);
-            const wsClient = clients.get(clientId);
-            const isWebSocketActive = hasWebSocket && wsClient && wsClient.ws && wsClient.ws.readyState === WebSocket.OPEN;
-            
-            if (isWebSocketActive) {
-                console.log(`[HTTP Register] ${clientName} has FULL CONTROL (WebSocket + HTTP)`);
+            if (hasWebSocket) {
+                const wsClient = clients.get(clientId);
+                // ודא שגם ה-WebSocket מעודכן עם השם החדש
+                if (wsClient.name !== clientName) {
+                    wsClient.name = clientName;
+                    console.log(`[HTTP Register] Updated WebSocket name to ${clientName}`);
+                }
+                console.log(`[HTTP Register] ${clientName} also has active WebSocket connection`);
             } else {
-                console.log(`[HTTP Register] ${clientName} is LIMITED (HTTP only, no WebSocket)`);
+                console.log(`[HTTP Register] ${clientName} has NO WebSocket (remote control unavailable)`);
             }
             
             res.status(200).send('Presence updated.');
