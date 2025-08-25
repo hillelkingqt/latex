@@ -146,14 +146,14 @@ wss.on('connection', (ws, req) => {
         }
     });
     
-    console.log(`[WebSocket] Client Connected: ${clientName} (ID: ${clientId.substring(0, 8)}...)`);
-    clients.set(clientId, { ws, name: clientName });
-    
-    // ✅ הוסף את השורה הזו - רשום גם ב-cache
-    cache.set(`client:${clientId}`, { name: clientName }, 300); // 5 דקות במקום 120 שניות
-    
-    // ✅ הוסף לוג שמראה את מצב הלקוח
-    console.log(`[WebSocket] Client ${clientName} now has FULL CONTROL (WebSocket + HTTP)`);
+console.log(`[WebSocket] Client Connected: ${clientName} (ID: ${clientId.substring(0, 8)}...)`);
+clients.set(clientId, { ws, name: clientName });
+
+// ✅ רשום ב-cache עם TTL ארוך יותר לוובסוקט
+cache.set(`client:${clientId}`, { name: clientName }, 600); // 10 דקות לחיבור WebSocket
+
+// ✅ הוסף לוג שמראה את מצב הלקוח
+console.log(`[WebSocket] Client ${clientName} - FULL CONTROL ESTABLISHED (WebSocket + HTTP Cache)`);
 
     ws.on('message', (message) => {
         try {
@@ -227,40 +227,35 @@ app.post('/register', (req, res) => {
     try {
         const { clientId, clientName } = req.body;
         if (clientId && clientName) {
-            // נקה כל המטמון הישן של הלקוח הזה לפני עדכון
-            const allCacheKeys = cache.keys();
-            allCacheKeys.forEach(key => {
-                if (key.startsWith('client:') && key === `client:${clientId}`) {
-                    const oldData = cache.get(key);
-                    if (oldData && oldData.name !== clientName) {
-                        cache.del(key);
-                        console.log(`[HTTP Register] Cleared old cache for ${oldData.name}`);
-                    }
-                }
-            });
+            // ✅ בדיקה ראשונה: האם יש WebSocket פעיל לפני שאנחנו עושים משהו
+            const hasActiveWebSocket = clients.has(clientId);
+            const wsClient = clients.get(clientId);
+            const isWebSocketActive = hasActiveWebSocket && wsClient && wsClient.ws && wsClient.ws.readyState === WebSocket.OPEN;
             
-            // עדכן את השם במטמון
-            cache.set(`client:${clientId}`, { name: clientName }, 120); // Keep for 2 minutes
-            
-            // ✅ לוג משופר
-            const shortId = clientId.substring(0, 8);
-            console.log(`[HTTP Register] Updated presence for ${clientName} (ID: ${shortId}...)`);
-            
-            // ✅ בדיקה אם יש גם WebSocket
-            const hasWebSocket = clients.has(clientId);
-            if (hasWebSocket) {
-                const wsClient = clients.get(clientId);
-                // ודא שגם ה-WebSocket מעודכן עם השם החדש
+            if (isWebSocketActive) {
+                // אם יש WebSocket פעיל, עדכן רק את השם שלו ואל תיגע למטמון
                 if (wsClient.name !== clientName) {
                     wsClient.name = clientName;
-                    console.log(`[HTTP Register] Updated WebSocket name to ${clientName}`);
+                    console.log(`[HTTP Register] Updated WebSocket name to ${clientName} (WebSocket already active)`);
                 }
-                console.log(`[HTTP Register] ${clientName} also has active WebSocket connection`);
-            } else {
-                console.log(`[HTTP Register] ${clientName} has NO WebSocket (remote control unavailable)`);
+                
+                // עדכן גם את ה-cache להתאמה
+                cache.set(`client:${clientId}`, { name: clientName }, 300); // 5 דקות
+                
+                const shortId = clientId.substring(0, 8);
+                console.log(`[HTTP Register] ${clientName} (ID: ${shortId}...) - FULL CONTROL (WebSocket + HTTP)`);
+                
+                res.status(200).send('Presence updated - Full Control');
+                return;
             }
             
-            res.status(200).send('Presence updated.');
+            // אם אין WebSocket פעיל, זה רק HTTP Register
+            cache.set(`client:${clientId}`, { name: clientName }, 120); // 2 דקות בלבד
+            
+            const shortId = clientId.substring(0, 8);
+            console.log(`[HTTP Register] ${clientName} (ID: ${shortId}...) - LIMITED (HTTP only, no WebSocket)`);
+            
+            res.status(200).send('Presence updated - Limited');
         } else {
             res.status(400).send('Missing client info.');
         }
@@ -837,18 +832,23 @@ async function showClientList(chatId, messageId) {
             const clientData = cache.get(key);
             if (clientData) {
                 // ✅ בדיקה מדויקת יותר
-                const hasWebSocket = clients.has(clientId);
-                const wsClient = clients.get(clientId);
-                const isWebSocketActive = hasWebSocket && wsClient && wsClient.ws && wsClient.ws.readyState === WebSocket.OPEN;
-                
-                // התיקון הוא כאן - תן עדיפות לחיבור WebSocket
-                if (isWebSocketActive) {
-                    // יש WebSocket פעיל = פיצ'רים מלאים
-                    keyboard.push([{ text: `🟢 ${clientData.name} (Full Control)`, callback_data: makeCb('select_client', { clientId }) }]);
-                } else {
-                    // אין WebSocket פעיל = רק HTTP Register
-                    keyboard.push([{ text: `🟡 ${clientData.name} (Limited - No Remote Control)`, callback_data: `noop` }]);
-                }
+// ✅ בדיקה מדויקת עם עדיפות ל-WebSocket
+const hasWebSocket = clients.has(clientId);
+const wsClient = clients.get(clientId);
+const isWebSocketActive = hasWebSocket && wsClient && wsClient.ws && wsClient.ws.readyState === WebSocket.OPEN;
+const hasRecentCache = cache.get(key) !== undefined;
+
+// ✅ תן עדיפות מוחלטת לסטטוס WebSocket
+if (isWebSocketActive) {
+    // WebSocket פעיל = תמיד Full Control
+    keyboard.push([{ text: `🟢 ${wsClient.name || clientData.name} (Full Control)`, callback_data: makeCb('select_client', { clientId }) }]);
+} else if (hasRecentCache) {
+    // רק HTTP Register = Limited
+    keyboard.push([{ text: `🟡 ${clientData.name} (Limited - No Remote Control)`, callback_data: `noop` }]);
+} else {
+    // כלום = Offline
+    keyboard.push([{ text: `🔴 ${clientData.name} (Offline)`, callback_data: `noop` }]);
+}
             }
         });
     }
