@@ -829,17 +829,6 @@ async function showClientList(chatId, messageId) {
     }
 }
     
-    keyboard.push([{ text: '‹ Back to Main Menu', callback_data: 'back_to_main' }]);
-    const text = clientKeys.length > 0 ? 'Client Status Legend:\n🟢 = Full Control Available\n🟡 = App Running (No Remote Control)\n🔴 = Offline\n\nSelect a client:' : 'No clients are currently connected.';
-
-    const options = { chat_id: chatId, reply_markup: { inline_keyboard: keyboard } };
-
-    if (messageId) {
-        bot.editMessageText(text, { ...options, message_id: messageId }).catch(console.error);
-    } else {
-        bot.sendMessage(chatId, text, options).catch(console.error);
-    }
-}
 
 function showBroadcastMenu(chatId, messageId) {
     const text = 'Broadcast management options:';
